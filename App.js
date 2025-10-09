@@ -12,6 +12,7 @@ import {
   PermissionsAndroid,
   Platform,
   Linking,
+  ActivityIndicator,
 } from 'react-native';
 import { SafeAreaView } from 'react-native-safe-area-context';
 import DashboardScreen from './src/screens/DashboardScreen';
@@ -29,6 +30,8 @@ export default function App() {
   const [isFallDetectionActive, setIsFallDetectionActive] = useState(false);
   const [fallProbability, setFallProbability] = useState(0);
   const [permissionsGranted, setPermissionsGranted] = useState(false);
+  const [isModelLoaded, setIsModelLoaded] = useState(false); // ✅ NEW: Track model load state
+  const [isModelLoading, setIsModelLoading] = useState(true); // ✅ NEW: Track loading status
 
   useEffect(() => {
     // Check permissions on mount
@@ -41,27 +44,32 @@ export default function App() {
       const fallDetectionListener = eventEmitter.addListener(
         'onFallDetected',
         (event) => {
-          console.log('🚨 Fall detected!', event);
+          console.log('🚨 FALL DETECTED EVENT:', event);
           setFallProbability(event.probability);
           setIsEmergencyActive(true);
         }
       );
 
-      // Load the TensorFlow model on app start
+      // ✅ Load the TensorFlow model on app start with state tracking
+      setIsModelLoading(true);
       TensorFlowModule.loadFallDetectionModel()
         .then((result) => {
           console.log('✅ Model loaded:', result);
+          setIsModelLoaded(true);
+          setIsModelLoading(false);
         })
         .catch((error) => {
           console.error('❌ Model load error:', error);
+          setIsModelLoaded(false);
+          setIsModelLoading(false);
+          Alert.alert(
+            'Model Load Error',
+            `Failed to load fall detection model: ${error.message}\n\nMake sure the model file is in android/app/src/main/assets/models/`
+          );
         });
 
       return () => {
         fallDetectionListener.remove();
-        if (isFallDetectionActive) {
-          TensorFlowModule.stopFallDetection()
-            .catch(err => console.error('Error stopping fall detection:', err));
-        }
       };
     }
   }, []);
@@ -154,10 +162,22 @@ export default function App() {
     }
   };
 
-  // ✅ TOGGLE FALL DETECTION WITH PERMISSION CHECK
+  // ✅ TOGGLE FALL DETECTION WITH MODEL CHECK
   const handleToggleFallDetection = async () => {
     if (!TensorFlowModule) {
       Alert.alert('Error', 'TensorFlow module not available');
+      return;
+    }
+
+    // ✅ Check if model is loaded
+    if (!isModelLoaded) {
+      Alert.alert(
+        '⚠️ Model Not Ready',
+        'Fall detection model is still loading. Please wait...',
+        [
+          { text: 'OK' }
+        ]
+      );
       return;
     }
 
@@ -181,46 +201,24 @@ export default function App() {
       // START
       TensorFlowModule.startFallDetection()
         .then(() => {
-          setIsFallDetectionActive(true);
           console.log('✅ Fall detection started');
-          Alert.alert(
-            '✅ Fall Detection Active',
-            '🤖 AI is monitoring your movements\n\n' +
-            '📊 50Hz sensor sampling\n' +
-            '🧠 TensorFlow Lite ML model active\n' +
-            '⚡ Real-time fall detection\n\n' +
-            'If a fall is detected, you will have 30 seconds to cancel the emergency alert.',
-            [{ text: 'Got it!' }]
-          );
+          setIsFallDetectionActive(true);
         })
         .catch((error) => {
           console.error('❌ Start error:', error);
-          Alert.alert(
-            'Cannot Start Fall Detection',
-            `Error: ${error.message}\n\n` +
-            'Possible causes:\n' +
-            '• Sensors not available on this device\n' +
-            '• Model not loaded properly\n' +
-            '• Sensor registration failed',
-
-            [
-              { text: 'Cancel', style: 'cancel' },
-              { text: 'Check Permissions', onPress: requestPermissions }
-            ]
-          );
+          Alert.alert('Error', `Failed to start: ${error.message}`);
         });
     } else {
       // STOP
       TensorFlowModule.stopFallDetection()
         .then(() => {
+          console.log('✅ Fall detection stopped');
           setIsFallDetectionActive(false);
-          console.log('🛑 Fall detection stopped');
-          Alert.alert('🛑 Stopped', 'Fall detection has been stopped.');
+          setFallProbability(0);
         })
         .catch((error) => {
           console.error('❌ Stop error:', error);
-          setIsFallDetectionActive(false);
-          Alert.alert('Stopped', 'Fall detection has been stopped.');
+          Alert.alert('Error', `Failed to stop: ${error.message}`);
         });
     }
   };
@@ -260,7 +258,7 @@ export default function App() {
     <SafeAreaView style={commonStyles.container}>
       <StatusBar barStyle="light-content" />
 
-      {/* ✅ PERMISSION WARNING BANNER - Only shows if missing */}
+      {/* ✅ PERMISSION WARNING BANNER */}
       {!permissionsGranted && (
         <TouchableOpacity 
           style={styles.permissionBanner}
@@ -277,6 +275,14 @@ export default function App() {
         </TouchableOpacity>
       )}
 
+      {/* ✅ MODEL LOADING BANNER */}
+      {isModelLoading && (
+        <View style={styles.modelLoadingBanner}>
+          <ActivityIndicator size="small" color="#ffffff" />
+          <Text style={styles.modelLoadingText}>Loading fall detection model...</Text>
+        </View>
+      )}
+
       {/* Fall Detection Toggle Bar */}
       <View style={styles.fallDetectionBar}>
         <View style={styles.statusContainer}>
@@ -285,7 +291,12 @@ export default function App() {
           </Text>
           {isFallDetectionActive && (
             <Text style={styles.statusSubtext}>
-              🧠 ML Active • 📊 50Hz Sampling
+              🧠 CNN Active • 📊 50Hz Sampling
+            </Text>
+          )}
+          {!isModelLoaded && !isModelLoading && (
+            <Text style={styles.statusError}>
+              ❌ Model failed to load
             </Text>
           )}
         </View>
@@ -293,9 +304,10 @@ export default function App() {
           style={[
             styles.toggleButton,
             isFallDetectionActive ? styles.toggleButtonActive : styles.toggleButtonInactive,
-            !permissionsGranted && styles.toggleButtonDisabled
+            (!permissionsGranted || !isModelLoaded) && styles.toggleButtonDisabled
           ]}
           onPress={handleToggleFallDetection}
+          disabled={!isModelLoaded || isModelLoading}
         >
           <Text style={styles.toggleButtonText}>
             {isFallDetectionActive ? '⏹ STOP' : '▶ START'}
@@ -396,5 +408,24 @@ const styles = StyleSheet.create({
   },
   toggleButtonDisabled: {
     opacity: 0.5,
+  },
+  // ✅ NEW STYLES
+  modelLoadingBanner: {
+    backgroundColor: '#2196F3',
+    paddingHorizontal: 15,
+    paddingVertical: 10,
+    flexDirection: 'row',
+    alignItems: 'center',
+    gap: 10,
+  },
+  modelLoadingText: {
+    color: '#fff',
+    fontSize: 13,
+    fontWeight: '600',
+  },
+  statusError: {
+    color: '#ff5722',
+    fontSize: 10,
+    fontWeight: '500',
   },
 });
