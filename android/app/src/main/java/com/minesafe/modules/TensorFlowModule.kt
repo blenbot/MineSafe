@@ -19,9 +19,17 @@ class TensorFlowModule(reactContext: ReactApplicationContext) :
 
     companion object {
         private const val TAG = "TensorFlowModule"
-        private const val WINDOW_SIZE = 50  // 50 timesteps for CNN
-        private const val FALL_THRESHOLD = 0.35f  // Optimized threshold
-        private const val FALL_COOLDOWN = 5000L  // 5 seconds between detections
+        private const val WINDOW_SIZE = 50
+        private const val WINDOW_STRIDE = 25
+        private const val FALL_THRESHOLD = 0.35f
+        private const val FALL_COOLDOWN = 5000L
+        
+        // Fall pattern detection thresholds
+        private const val FREE_FALL_THRESHOLD = 5.0f  // Total acc < 5 m/s² (near weightlessness)
+        private const val IMPACT_THRESHOLD = 20.0f    // Total acc > 20 m/s² (hard impact)
+        private const val POST_IMPACT_STILLNESS = 12.0f // Low movement after fall
+        private const val MIN_FREE_FALL_DURATION = 3  // At least 3 samples in free fall
+        private const val GYRO_ROTATION_THRESHOLD = 3.0f  // rad/s - significant rotation during fall
     }
 
     private var interpreter: TFLiteInterpreter? = null
@@ -31,16 +39,14 @@ class TensorFlowModule(reactContext: ReactApplicationContext) :
     
     private var isMonitoring = false
     
-    // Current sensor readings
     private val accData = FloatArray(3)
     private val gyroData = FloatArray(3)
-    
-    // Windowed data buffer: List of [acc_x, acc_y, acc_z, gyro_x, gyro_y, gyro_z]
     private val dataWindow = mutableListOf<FloatArray>()
     
     private var lastFallTime = 0L
+    private var lastInferenceTime = 0L
+    private var sampleCounter = 0
     
-    // Flags to track sensor updates
     private var hasAccData = false
     private var hasGyroData = false
 
@@ -51,22 +57,18 @@ class TensorFlowModule(reactContext: ReactApplicationContext) :
         try {
             Log.d(TAG, "🔄 Loading CNN fall detection model...")
             
-            // Load the new CNN model
             val modelFile = loadModelFile("models/fall_detection_cnn_model.tflite")
             interpreter = TFLiteInterpreter(modelFile)
             
-            // Log input/output tensor info
             val inputDetails = interpreter?.getInputTensor(0)
             val outputDetails = interpreter?.getOutputTensor(0)
             Log.d(TAG, "✅ Model input shape: ${inputDetails?.shape()?.contentToString()}")
             Log.d(TAG, "✅ Model output shape: ${outputDetails?.shape()?.contentToString()}")
             
-            // Initialize sensor manager
             sensorManager = reactApplicationContext.getSystemService(Context.SENSOR_SERVICE) as SensorManager
             accelerometer = sensorManager?.getDefaultSensor(Sensor.TYPE_ACCELEROMETER)
             gyroscope = sensorManager?.getDefaultSensor(Sensor.TYPE_GYROSCOPE)
             
-            // Check sensor availability
             if (accelerometer == null) {
                 Log.e(TAG, "❌ Accelerometer not available!")
                 promise.reject("SENSOR_ERROR", "Accelerometer not available")
@@ -101,12 +103,12 @@ class TensorFlowModule(reactContext: ReactApplicationContext) :
                 return
             }
             
-            // Clear buffer
             dataWindow.clear()
             hasAccData = false
             hasGyroData = false
+            sampleCounter = 0
+            lastInferenceTime = 0L
             
-            // Register sensors at ~50Hz (SENSOR_DELAY_GAME = ~20ms)
             accelerometer?.let { 
                 sensorManager?.registerListener(this, it, SensorManager.SENSOR_DELAY_GAME)
                 Log.d(TAG, "✅ Accelerometer registered at ~50Hz")
@@ -119,7 +121,7 @@ class TensorFlowModule(reactContext: ReactApplicationContext) :
             
             isMonitoring = true
             
-            Log.d(TAG, "✅ Fall detection started with CNN model")
+            Log.d(TAG, "✅ Fall detection started with pattern validation")
             promise.resolve("Fall detection started successfully")
         } catch (e: Exception) {
             Log.e(TAG, "❌ Detection start error", e)
@@ -144,6 +146,7 @@ class TensorFlowModule(reactContext: ReactApplicationContext) :
             hasGyroData = false
             isMonitoring = false
             lastFallTime = 0L
+            sampleCounter = 0
 
             Log.d(TAG, "✅ Fall detection stopped")
             
@@ -174,68 +177,146 @@ class TensorFlowModule(reactContext: ReactApplicationContext) :
             }
         }
         
-        // Only add to window when we have both sensor readings
         if (hasAccData && hasGyroData) {
-            // Create reading: [acc_x, acc_y, acc_z, gyro_x, gyro_y, gyro_z]
             val reading = floatArrayOf(
                 accData[0], accData[1], accData[2],
                 gyroData[0], gyroData[1], gyroData[2]
             )
             
             dataWindow.add(reading)
+            sampleCounter++
             
-            // Maintain window size (50 readings)
             if (dataWindow.size > WINDOW_SIZE) {
                 dataWindow.removeAt(0)
             }
             
-            // Run inference when we have exactly 50 readings
-            if (dataWindow.size == WINDOW_SIZE) {
-                runCNNInference()
+            if (dataWindow.size == WINDOW_SIZE && sampleCounter >= WINDOW_STRIDE) {
+                if (hasFallPattern()) {
+                    runCNNInference()
+                } else {
+                    Log.d(TAG, "⏸️ No fall pattern detected, skipping inference")
+                }
+                sampleCounter = 0
             }
         }
     }
 
     override fun onAccuracyChanged(sensor: Sensor?, accuracy: Int) {}
 
+    /**
+     * Enhanced fall pattern detection with multi-stage validation
+     * Returns true only if the window contains a realistic fall signature
+     */
+    private fun hasFallPattern(): Boolean {
+        if (dataWindow.size < WINDOW_SIZE) return false
+        
+        // Calculate acceleration magnitudes
+        val accMagnitudes = dataWindow.map { 
+            sqrt(it[0] * it[0] + it[1] * it[1] + it[2] * it[2])
+        }
+        
+        // Calculate gyroscope magnitudes (rotation rate)
+        val gyroMagnitudes = dataWindow.map {
+            sqrt(it[3] * it[3] + it[4] * it[4] + it[5] * it[5])
+        }
+        
+        // Stage 1: Check for free fall phase (low acceleration)
+        val freeFallSamples = accMagnitudes.count { it < FREE_FALL_THRESHOLD }
+        val hasFreeFall = freeFallSamples >= MIN_FREE_FALL_DURATION
+        
+        // Stage 2: Check for impact phase (high acceleration spike)
+        val maxAcceleration = accMagnitudes.maxOrNull() ?: 0f
+        val hasImpact = maxAcceleration > IMPACT_THRESHOLD
+        
+        // Stage 3: Check for significant rotation (body orientation change)
+        val maxRotation = gyroMagnitudes.maxOrNull() ?: 0f
+        val hasRotation = maxRotation > GYRO_ROTATION_THRESHOLD
+        
+        // Stage 4: Check temporal sequence (free fall should come before impact)
+        val freeFallIndex = accMagnitudes.indexOfFirst { it < FREE_FALL_THRESHOLD }
+        val impactIndex = accMagnitudes.indexOfLast { it == maxAcceleration }
+        val validSequence = freeFallIndex >= 0 && impactIndex > freeFallIndex
+        
+        // Stage 5: Check for post-impact stillness (person lying down)
+        val lastQuarter = accMagnitudes.takeLast(WINDOW_SIZE / 4)
+        val postImpactMean = lastQuarter.average().toFloat()
+        val postImpactVariance = lastQuarter.map { (it - postImpactMean) * (it - postImpactMean) }.average().toFloat()
+        val hasStillness = postImpactVariance < 5.0f && postImpactMean < POST_IMPACT_STILLNESS
+        
+        // Calculate acceleration range to filter out simple jerks
+        val accRange = maxAcceleration - (accMagnitudes.minOrNull() ?: 0f)
+        val significantChange = accRange > 15.0f
+        
+        // Log detailed pattern analysis
+        Log.d(TAG, """
+            📊 Fall Pattern Analysis:
+            ├─ Free fall samples: $freeFallSamples/${MIN_FREE_FALL_DURATION} ✓${if (hasFreeFall) "YES" else "NO"}
+            ├─ Max acceleration: ${maxAcceleration.toInt()} m/s² (>${IMPACT_THRESHOLD.toInt()}) ✓${if (hasImpact) "YES" else "NO"}
+            ├─ Max rotation: ${maxRotation.toInt()} rad/s (>${GYRO_ROTATION_THRESHOLD.toInt()}) ✓${if (hasRotation) "YES" else "NO"}
+            ├─ Valid sequence: ✓${if (validSequence) "YES" else "NO"} (FF@$freeFallIndex → Impact@$impactIndex)
+            ├─ Post-impact stillness: ${postImpactVariance.toInt()} variance ✓${if (hasStillness) "YES" else "NO"}
+            └─ Significant change: ${accRange.toInt()} m/s² ✓${if (significantChange) "YES" else "NO"}
+        """.trimIndent())
+        
+        // Require at least 4 out of 6 conditions to pass (you can adjust this)
+        val passedConditions = listOf(
+            hasFreeFall,
+            hasImpact,
+            hasRotation,
+            validSequence,
+            hasStillness,
+            significantChange
+        ).count { it }
+        
+        val isFallPattern = passedConditions >= 4
+        
+        if (isFallPattern) {
+            Log.w(TAG, "🎯 Fall pattern detected! ($passedConditions/6 conditions met)")
+        } else {
+            Log.d(TAG, "❌ Not a fall pattern ($passedConditions/6 conditions met)")
+        }
+        
+        return isFallPattern
+    }
+
     private fun runCNNInference() {
         try {
             val currentTime = System.currentTimeMillis()
+            
             if (currentTime - lastFallTime < FALL_COOLDOWN) {
+                Log.d(TAG, "⏳ Cooldown active, skipping inference")
                 return
             }
             
-            // Check buffer size
             if (dataWindow.size != WINDOW_SIZE) {
                 Log.w(TAG, "⚠️ Buffer size mismatch: ${dataWindow.size} != $WINDOW_SIZE")
                 return
             }
             
-            // Step 1: Normalize data (z-score normalization per feature)
+            lastInferenceTime = currentTime
+            
             val normalizedData = normalizeData(dataWindow)
             
-            // Step 2: Prepare input tensor [1, 50, 6]
             val inputArray = Array(1) { 
                 Array(WINDOW_SIZE) { timestep ->
                     normalizedData[timestep]
                 }
             }
             
-            // Step 3: Prepare output tensor [1, 1]
             val outputArray = Array(1) { FloatArray(1) }
             
-            // Step 4: Run CNN inference
             interpreter?.run(inputArray, outputArray)
             
             val fallProbability = outputArray[0][0]
             
             Log.d(TAG, "🧠 CNN Inference - Fall probability: ${(fallProbability * 100).toInt()}%")
             
-            // Step 5: Apply threshold (0.35 for fall detection)
             if (fallProbability > FALL_THRESHOLD) {
                 Log.w(TAG, "🚨 FALL DETECTED! Probability: ${(fallProbability * 100).toInt()}%")
                 lastFallTime = currentTime
                 sendFallDetectionEvent(fallProbability)
+            } else {
+                Log.d(TAG, "✅ Pattern validated but probability too low (${(fallProbability * 100).toInt()}%)")
             }
             
         } catch (e: Exception) {
@@ -244,30 +325,18 @@ class TensorFlowModule(reactContext: ReactApplicationContext) :
         }
     }
 
-    /**
-     * Normalize data using z-score normalization per feature column
-     * Input: List of [acc_x, acc_y, acc_z, gyro_x, gyro_y, gyro_z] readings
-     * Output: Normalized 2D array [50 timesteps × 6 features]
-     */
     private fun normalizeData(data: List<FloatArray>): Array<FloatArray> {
         val numFeatures = 6
         val normalizedData = Array(WINDOW_SIZE) { FloatArray(numFeatures) }
         
-        // Normalize each feature column
         for (featureIdx in 0 until numFeatures) {
-            // Extract column values
             val columnValues = data.map { it[featureIdx] }
-            
-            // Calculate mean
             val mean = columnValues.average().toFloat()
-            
-            // Calculate standard deviation
             val variance = columnValues.map { (it - mean) * (it - mean) }.average()
             val std = sqrt(variance).toFloat()
             
-            // Normalize column (handle std = 0 case)
             for (timestep in 0 until WINDOW_SIZE) {
-                normalizedData[timestep][featureIdx] = if (std == 0f) {
+                normalizedData[timestep][featureIdx] = if (std < 0.001f) {
                     0f
                 } else {
                     (data[timestep][featureIdx] - mean) / std
@@ -301,10 +370,6 @@ class TensorFlowModule(reactContext: ReactApplicationContext) :
         return fileChannel.map(FileChannel.MapMode.READ_ONLY, startOffset, declaredLength)
     }
 
-    // ============================================================
-    // PLACEHOLDER METHODS (kept for compatibility)
-    // ============================================================
-    
     @ReactMethod
     fun loadScreamFightDetectionModel(promise: Promise) {
         promise.resolve("Not implemented")
