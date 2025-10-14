@@ -22,7 +22,7 @@ import EmergencyAlertScreen from './src/screens/EmergencyScreen';
 import BottomNavigation from './src/components/BottomNavigation';
 import { commonStyles } from './src/styles/commonStyles';
 
-const { TensorFlowModule, OpenSettings } = NativeModules;
+const { TensorFlowModule, ScreamDetectionModule, OpenSettings } = NativeModules;
 
 export default function App() {
   const [currentScreen, setCurrentScreen] = useState('dashboard');
@@ -32,6 +32,9 @@ export default function App() {
   const [permissionsGranted, setPermissionsGranted] = useState(false);
   const [isModelLoaded, setIsModelLoaded] = useState(false); // ✅ NEW: Track model load state
   const [isModelLoading, setIsModelLoading] = useState(true); // ✅ NEW: Track loading status
+  
+  // Scream Detection State
+  const [isScreamDetectionActive, setIsScreamDetectionActive] = useState(false);
 
   useEffect(() => {
     // Check permissions on mount
@@ -49,6 +52,19 @@ export default function App() {
           setIsEmergencyActive(true);
         }
       );
+
+      // Set up scream detection listener
+      let screamDetectionListener = null;
+      if (ScreamDetectionModule) {
+        const screamEventEmitter = new NativeEventEmitter(ScreamDetectionModule);
+        screamDetectionListener = screamEventEmitter.addListener(
+          'onScreamDetected',
+          (event) => {
+            console.log('🚨 SCREAM DETECTED EVENT:', event);
+            setIsEmergencyActive(true);
+          }
+        );
+      }
 
       // ✅ Load the TensorFlow model on app start with state tracking
       setIsModelLoading(true);
@@ -70,11 +86,14 @@ export default function App() {
 
       return () => {
         fallDetectionListener.remove();
+        if (screamDetectionListener) {
+          screamDetectionListener.remove();
+        }
       };
     }
   }, []);
 
-  // ✅ CLEAN PERMISSION CHECK - Only Location needed (sensors are always available!)
+  // ✅ CLEAN PERMISSION CHECK - Location and Audio permissions
   const checkPermissions = async () => {
     if (Platform.OS !== 'android') {
       setPermissionsGranted(true);
@@ -82,16 +101,20 @@ export default function App() {
     }
 
     try {
-      // Only check location permission - motion sensors don't need permissions!
+      // Check location and audio permissions
       const fineLocation = await PermissionsAndroid.check(
         PermissionsAndroid.PERMISSIONS.ACCESS_FINE_LOCATION
       );
+      
+      const audio = await PermissionsAndroid.check(
+        PermissionsAndroid.PERMISSIONS.RECORD_AUDIO
+      );
 
-      if (fineLocation) {
-        console.log('✅ Location permission granted - Fall detection ready!');
+      if (fineLocation && audio) {
+        console.log('✅ All permissions granted - Detection ready!');
         setPermissionsGranted(true);
       } else {
-        console.log('⚠️ Location permission missing');
+        console.log('⚠️ Permissions missing - Location:', fineLocation, 'Audio:', audio);
         setPermissionsGranted(false);
       }
     } catch (err) {
@@ -110,35 +133,44 @@ export default function App() {
     try {
       console.log('📋 Requesting permissions...');
 
-      // Request only Location permission - motion sensors are always available!
+      // Request Location and Audio permissions
       const granted = await PermissionsAndroid.requestMultiple([
         PermissionsAndroid.PERMISSIONS.ACCESS_FINE_LOCATION,
         PermissionsAndroid.PERMISSIONS.ACCESS_COARSE_LOCATION,
         PermissionsAndroid.PERMISSIONS.ACTIVITY_RECOGNITION,
+        PermissionsAndroid.PERMISSIONS.RECORD_AUDIO,
       ]);
 
       console.log('Permission results:', granted);
 
-      // Check if location permission granted (sensors don't need permission!)
+      // Check if required permissions granted
       const locationGranted = 
         granted[PermissionsAndroid.PERMISSIONS.ACCESS_FINE_LOCATION] === PermissionsAndroid.RESULTS.GRANTED;
+      
+      const audioGranted = 
+        granted[PermissionsAndroid.PERMISSIONS.RECORD_AUDIO] === PermissionsAndroid.RESULTS.GRANTED;
 
-      if (locationGranted) {
+      if (locationGranted && audioGranted) {
         setPermissionsGranted(true);
         Alert.alert(
           '✅ Permissions Granted',
           '📍 Location permission granted\n' +
-          '📊 Sensors are always available (no permission needed!)\n\n' +
-          'Fall detection is ready to use!',
+          '🎤 Audio permission granted\n' +
+          '📊 Sensors are always available!\n\n' +
+          'All detection features are ready to use!',
           [{ text: 'OK' }]
         );
       } else {
         setPermissionsGranted(false);
 
+        const missingPerms = [];
+        if (!locationGranted) missingPerms.push('📍 Location');
+        if (!audioGranted) missingPerms.push('🎤 Audio');
+
         Alert.alert(
-          '⚠️ Location Permission Required',
-          '📍 Location permission is needed to send GPS coordinates in emergency alerts.\n\n' +
-          '📊 Motion sensors (accelerometer/gyroscope) are always available - no permission needed!',
+          '⚠️ Permissions Required',
+          `${missingPerms.join('\n')} permission(s) needed for full functionality.\n\n` +
+          '📊 Motion sensors are always available!',
           [
             { text: 'Cancel', style: 'cancel' },
             { text: 'Open Settings', onPress: openSettings }
@@ -219,6 +251,54 @@ export default function App() {
         .catch((error) => {
           console.error('❌ Stop error:', error);
           Alert.alert('Error', `Failed to stop: ${error.message}`);
+        });
+    }
+  };
+
+  // ✅ TOGGLE SCREAM DETECTION
+  const handleToggleScreamDetection = async () => {
+    if (!ScreamDetectionModule) {
+      Alert.alert('Error', 'Scream detection module not available');
+      return;
+    }
+
+    // Check permissions before starting
+    if (!permissionsGranted) {
+      Alert.alert(
+        '⚠️ Permissions Required',
+        'Scream detection needs:\n\n' +
+        '🎤 Microphone - To listen for distress sounds\n' +
+        '📍 Location - To send your GPS coordinates in emergency alerts',
+        [
+          { text: 'Cancel', style: 'cancel' },
+          { text: 'Grant Permission', onPress: requestPermissions }
+        ]
+      );
+      return;
+    }
+
+    // START or STOP scream detection
+    if (!isScreamDetectionActive) {
+      // START
+      ScreamDetectionModule.startScreamDetection()
+        .then(() => {
+          console.log('✅ Scream detection started');
+          setIsScreamDetectionActive(true);
+        })
+        .catch((error) => {
+          console.error('❌ Start error:', error);
+          Alert.alert('Error', `Failed to start scream detection: ${error.message}`);
+        });
+    } else {
+      // STOP
+      ScreamDetectionModule.stopScreamDetection()
+        .then(() => {
+          console.log('✅ Scream detection stopped');
+          setIsScreamDetectionActive(false);
+        })
+        .catch((error) => {
+          console.error('❌ Stop error:', error);
+          Alert.alert('Error', `Failed to stop scream detection: ${error.message}`);
         });
     }
   };
@@ -315,6 +395,33 @@ export default function App() {
         </TouchableOpacity>
       </View>
 
+      {/* Scream Detection Toggle Bar */}
+      <View style={styles.screamDetectionBar}>
+        <View style={styles.statusContainer}>
+          <Text style={styles.screamDetectionText}>
+            {isScreamDetectionActive ? '🟢 Scream Detection: ON' : '⚪ Scream Detection: OFF'}
+          </Text>
+          {isScreamDetectionActive && (
+            <Text style={styles.statusSubtext}>
+              🎤 Audio Monitoring • 🧠 TFLite MFCC
+            </Text>
+          )}
+        </View>
+        <TouchableOpacity 
+          style={[
+            styles.toggleButton,
+            isScreamDetectionActive ? styles.toggleButtonActive : styles.toggleButtonInactive,
+            !permissionsGranted && styles.toggleButtonDisabled
+          ]}
+          onPress={handleToggleScreamDetection}
+          disabled={!permissionsGranted}
+        >
+          <Text style={styles.toggleButtonText}>
+            {isScreamDetectionActive ? '⏹ STOP' : '▶ START'}
+          </Text>
+        </TouchableOpacity>
+      </View>
+
       {/* Main Content */}
       {renderScreen()}
 
@@ -374,10 +481,26 @@ const styles = StyleSheet.create({
     borderBottomWidth: 1,
     borderBottomColor: '#333',
   },
+  screamDetectionBar: {
+    flexDirection: 'row',
+    alignItems: 'center',
+    justifyContent: 'space-between',
+    backgroundColor: '#1a1a1a',
+    paddingHorizontal: 15,
+    paddingVertical: 10,
+    borderBottomWidth: 1,
+    borderBottomColor: '#333',
+  },
   statusContainer: {
     flex: 1,
   },
   fallDetectionText: {
+    color: '#ffffff',
+    fontSize: 14,
+    fontWeight: 'bold',
+    marginBottom: 2,
+  },
+  screamDetectionText: {
     color: '#ffffff',
     fontSize: 14,
     fontWeight: 'bold',
