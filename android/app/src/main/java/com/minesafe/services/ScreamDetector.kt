@@ -6,12 +6,14 @@ import android.media.AudioRecord
 import android.media.MediaRecorder
 import android.util.Log
 import org.tensorflow.lite.Interpreter
-import com.jlibrosa.audio.JLibrosa
-import java.io.File
 import java.io.FileInputStream
-import java.io.FileOutputStream
 import java.nio.MappedByteBuffer
 import java.nio.channels.FileChannel
+import kotlin.math.PI
+import kotlin.math.cos
+import kotlin.math.ln
+import kotlin.math.sin
+import kotlin.math.sqrt
 
 class ScreamDetector(private val context: Context) {
     
@@ -20,7 +22,6 @@ class ScreamDetector(private val context: Context) {
     private var isDetecting = false
     private var recordingThread: Thread? = null
     private var onScreamDetectedCallback: (() -> Unit)? = null
-    private val jLibrosa = JLibrosa()
     
     companion object {
         private const val TAG = "ScreamDetector"
@@ -103,55 +104,34 @@ class ScreamDetector(private val context: Context) {
     }
     
     private fun processAudio() {
-        val audioBuffer = ShortArray(SAMPLE_RATE) // 1 second buffer
-        var samplesCollected = 0
+        val audioBuffer = ShortArray(BUFFER_SIZE)
         
         try {
             while (isDetecting) {
-                val readSize = audioRecord?.read(
-                    audioBuffer, 
-                    samplesCollected, 
-                    audioBuffer.size - samplesCollected
-                ) ?: 0
+                val readSize = audioRecord?.read(audioBuffer, 0, BUFFER_SIZE) ?: 0
                 
                 if (readSize > 0) {
-                    samplesCollected += readSize
+                    val floatBuffer = FloatArray(readSize) { 
+                        audioBuffer[it].toFloat() / 32768f 
+                    }
                     
-                    // Process every 1 second of audio
-                    if (samplesCollected >= audioBuffer.size) {
-                        // Convert to float array
-                        val floatBuffer = FloatArray(audioBuffer.size) { 
-                            audioBuffer[it].toFloat() / 32768f 
+                    val mfccFeatures = extractMFCC(floatBuffer)
+                    
+                    if (mfccFeatures.size == N_MFCC) {
+                        val prediction = predict(mfccFeatures)
+                        
+                        Log.d(TAG, "🧠 Scream probability: ${(prediction * 100).toInt()}%")
+                        
+                        val currentTime = System.currentTimeMillis()
+                        if (prediction > THRESHOLD && currentTime - lastScreamTime > SCREAM_COOLDOWN) {
+                            Log.w(TAG, "🚨 SCREAM DETECTED! Probability: ${(prediction * 100).toInt()}%")
+                            lastScreamTime = currentTime
+                            onScreamDetectedCallback?.invoke()
                         }
-                        
-                        // Save to temporary WAV file for JLibrosa
-                        val tempFile = saveTempWav(floatBuffer)
-                        
-                        // Extract MFCC using JLibrosa
-                        val mfccFeatures = extractMFCC(tempFile.absolutePath)
-                        
-                        // Clean up temp file
-                        tempFile.delete()
-                        
-                        if (mfccFeatures.size == N_MFCC) {
-                            val prediction = predict(mfccFeatures)
-                            
-                            Log.d(TAG, "🧠 Scream probability: ${(prediction * 100).toInt()}%")
-                            
-                            val currentTime = System.currentTimeMillis()
-                            if (prediction > THRESHOLD && currentTime - lastScreamTime > SCREAM_COOLDOWN) {
-                                Log.w(TAG, "🚨 SCREAM DETECTED! Probability: ${(prediction * 100).toInt()}%")
-                                lastScreamTime = currentTime
-                                onScreamDetectedCallback?.invoke()
-                            }
-                        }
-                        
-                        // Reset buffer
-                        samplesCollected = 0
                     }
                 }
                 
-                Thread.sleep(10)
+                Thread.sleep(20)
             }
         } catch (e: InterruptedException) {
             Log.d(TAG, "⚠️ Audio processing interrupted")
@@ -160,113 +140,81 @@ class ScreamDetector(private val context: Context) {
         }
     }
     
-    private fun saveTempWav(audioData: FloatArray): File {
-        val tempFile = File.createTempFile("audio", ".wav", context.cacheDir)
-        
-        FileOutputStream(tempFile).use { fos ->
-            // Write WAV header (simplified)
-            val header = createWavHeader(audioData.size)
-            fos.write(header)
-            
-            // Write audio data
-            for (sample in audioData) {
-                val intSample = (sample * 32767).toInt().coerceIn(-32768, 32767).toShort()
-                fos.write(intSample.toInt() and 0xFF)
-                fos.write((intSample.toInt() shr 8) and 0xFF)
-            }
-        }
-        
-        return tempFile
-    }
-    
-    private fun createWavHeader(dataSize: Int): ByteArray {
-        val header = ByteArray(44)
-        val byteRate = SAMPLE_RATE * 2 // 16-bit mono
-        val dataLength = dataSize * 2
-        
-        // RIFF header
-        header[0] = 'R'.code.toByte()
-        header[1] = 'I'.code.toByte()
-        header[2] = 'F'.code.toByte()
-        header[3] = 'F'.code.toByte()
-        
-        // File size
-        val fileSize = 36 + dataLength
-        header[4] = (fileSize and 0xFF).toByte()
-        header[5] = ((fileSize shr 8) and 0xFF).toByte()
-        header[6] = ((fileSize shr 16) and 0xFF).toByte()
-        header[7] = ((fileSize shr 24) and 0xFF).toByte()
-        
-        // WAVE header
-        header[8] = 'W'.code.toByte()
-        header[9] = 'A'.code.toByte()
-        header[10] = 'V'.code.toByte()
-        header[11] = 'E'.code.toByte()
-        
-        // fmt subchunk
-        header[12] = 'f'.code.toByte()
-        header[13] = 'm'.code.toByte()
-        header[14] = 't'.code.toByte()
-        header[15] = ' '.code.toByte()
-        header[16] = 16 // Subchunk1Size (16 for PCM)
-        header[18] = 1 // AudioFormat (1 for PCM)
-        header[22] = 1 // NumChannels (1 for mono)
-        
-        // SampleRate
-        header[24] = (SAMPLE_RATE and 0xFF).toByte()
-        header[25] = ((SAMPLE_RATE shr 8) and 0xFF).toByte()
-        header[26] = ((SAMPLE_RATE shr 16) and 0xFF).toByte()
-        header[27] = ((SAMPLE_RATE shr 24) and 0xFF).toByte()
-        
-        // ByteRate
-        header[28] = (byteRate and 0xFF).toByte()
-        header[29] = ((byteRate shr 8) and 0xFF).toByte()
-        header[30] = ((byteRate shr 16) and 0xFF).toByte()
-        header[31] = ((byteRate shr 24) and 0xFF).toByte()
-        
-        header[32] = 2 // BlockAlign
-        header[34] = 16 // BitsPerSample
-        
-        // data subchunk
-        header[36] = 'd'.code.toByte()
-        header[37] = 'a'.code.toByte()
-        header[38] = 't'.code.toByte()
-        header[39] = 'a'.code.toByte()
-        
-        // Data size
-        header[40] = (dataLength and 0xFF).toByte()
-        header[41] = ((dataLength shr 8) and 0xFF).toByte()
-        header[42] = ((dataLength shr 16) and 0xFF).toByte()
-        header[43] = ((dataLength shr 24) and 0xFF).toByte()
-        
-        return header
-    }
-    
-    private fun extractMFCC(audioPath: String): FloatArray {
+    private fun extractMFCC(audioData: FloatArray): FloatArray {
         return try {
-            // Load audio and extract MFCC using JLibrosa
-            val audioFeatureValues = jLibrosa.loadAndRead(audioPath, SAMPLE_RATE, -1)
-            
-            // Extract MFCC (n_mfcc=40)
-            val mfccValues = jLibrosa.generateMFCCFeatures(audioFeatureValues, SAMPLE_RATE, N_MFCC)
-            
-            // Average across time frames (same as Python: np.mean(mfccs.T, axis=0))
-            val meanMFCC = FloatArray(N_MFCC)
-            for (i in 0 until N_MFCC) {
-                var sum = 0f
-                var count = 0
-                for (j in mfccValues[i].indices) {
-                    sum += mfccValues[i][j]
-                    count++
-                }
-                meanMFCC[i] = if (count > 0) sum / count else 0f
-            }
-            
-            meanMFCC
+            val preEmphasized = preEmphasis(audioData)
+            val powerSpectrum = computePowerSpectrum(preEmphasized)
+            val melSpectrum = applyMelFilterbank(powerSpectrum)
+            val logMelSpectrum = melSpectrum.map { ln((it + 1e-10).toDouble()).toFloat() }
+            return dct(logMelSpectrum.toFloatArray()).take(N_MFCC).toFloatArray()
         } catch (e: Exception) {
             Log.e(TAG, "❌ MFCC extraction failed", e)
             FloatArray(N_MFCC) { 0f }
         }
+    }
+    
+    private fun preEmphasis(signal: FloatArray, coefficient: Float = 0.97f): FloatArray {
+        val result = FloatArray(signal.size)
+        result[0] = signal[0]
+        for (i in 1 until signal.size) {
+            result[i] = signal[i] - coefficient * signal[i - 1]
+        }
+        return result
+    }
+    
+    private fun computePowerSpectrum(signal: FloatArray): FloatArray {
+        val n = BUFFER_SIZE
+        val result = FloatArray(n / 2 + 1)
+        
+        for (k in result.indices) {
+            var real = 0.0
+            var imag = 0.0
+            val signalSize = minOf(signal.size, n)
+            
+            for (i in 0 until signalSize) {
+                val angle = 2.0 * PI * k * i / n
+                real += signal[i] * cos(angle)
+                imag += signal[i] * sin(angle)
+            }
+            
+            result[k] = (real * real + imag * imag).toFloat()
+        }
+        
+        return result
+    }
+    
+    private fun applyMelFilterbank(powerSpectrum: FloatArray): FloatArray {
+        val melBins = 128
+        val result = FloatArray(melBins)
+        val binSize = powerSpectrum.size / melBins
+        
+        for (i in 0 until melBins) {
+            val startBin = i * binSize
+            val endBin = minOf((i + 1) * binSize, powerSpectrum.size)
+            
+            var sum = 0f
+            for (j in startBin until endBin) {
+                sum += powerSpectrum[j]
+            }
+            result[i] = sum / (endBin - startBin)
+        }
+        
+        return result
+    }
+    
+    private fun dct(input: FloatArray): FloatArray {
+        val n = input.size
+        val result = FloatArray(n)
+        
+        for (k in result.indices) {
+            var sum = 0.0
+            for (i in input.indices) {
+                sum += input[i] * cos(PI * k * (2 * i + 1) / (2 * n))
+            }
+            result[k] = (sum * sqrt(2.0 / n)).toFloat()
+        }
+        
+        return result
     }
     
     private fun predict(features: FloatArray): Float {
