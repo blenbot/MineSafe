@@ -17,6 +17,7 @@ class MineSafePackage : ReactPackage {
         modules.add(ServerApiModule(reactContext))
         modules.add(LocationModule(reactContext))
         modules.add(TensorFlowModule(reactContext))
+        modules.add(ScreamDetectionModule(reactContext))
         modules.add(EmergencyModule(reactContext))
         modules.add(OfflineCommModule(reactContext))
         modules.add(ChatbotModule(reactContext))

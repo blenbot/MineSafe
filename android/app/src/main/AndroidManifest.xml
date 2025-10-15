@@ -7,6 +7,7 @@
     <uses-permission android:name="android.permission.VIBRATE" />
     
     <uses-permission android:name="android.permission.FOREGROUND_SERVICE" />
+    <uses-permission android:name="android.permission.FOREGROUND_SERVICE_MICROPHONE" />
 
     <!-- Network & Communication -->
     <uses-permission android:name="android.permission.INTERNET" />
@@ -51,5 +52,11 @@
             <category android:name="android.intent.category.LAUNCHER" />
         </intent-filter>
       </activity>
+      
+      <!-- Scream Detection Service -->
+      <service
+        android:name=".services.ScreamDetectionService"
+        android:foregroundServiceType="microphone"
+        android:exported="false" />
     </application>
 </manifest>
