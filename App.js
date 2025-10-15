@@ -11,108 +11,267 @@ import {
   StyleSheet,
   PermissionsAndroid,
   Platform,
-  Linking,
   ActivityIndicator,
+  AppState,
 } from 'react-native';
 import { SafeAreaView } from 'react-native-safe-area-context';
 import { NavigationContainer } from '@react-navigation/native';
 import { createNativeStackNavigator } from '@react-navigation/native-stack';
+import NetInfo from '@react-native-community/netinfo';
 
-// Import all screens
-import SplashScreen from './src/screens/SplashScreen';
-import LanguageSelectionScreen from './src/screens/LanguageSelectionScreen';
-import OnboardingScreen from './src/screens/OnboardingScreen';
+// Services
+import AuthService from './src/services/auth/AuthService';
+import EmergencyManager from './src/services/EmergencyManager';
+
+// Screens
+import LoginScreen from './src/screens/LoginScreen';
 import HomeScreen from './src/screens/HomeScreen';
 import SOSScreen from './src/screens/SOSScreen';
 import ChatbotScreen from './src/screens/ChatbotScreen';
 import ReportHazardScreen from './src/screens/ReportHazardScreen';
 import HazardDetailsScreen from './src/screens/HazardDetailsScreen';
+import ReviewReportScreen from './src/screens/ReviewReportScreen';
 import TrainingModuleScreen from './src/screens/TrainingModuleScreen';
 import WorkerProfileScreen from './src/screens/WorkerProfileScreen';
 
-const { TensorFlowModule, ScreamDetectionModule, OpenSettings } = NativeModules;
+import colors from './src/utils/colors';
+
+const Stack = createNativeStackNavigator();
+const { TensorFlowModule, ScreamDetectionModule, OfflineCommModule } = NativeModules;
 
 export default function App() {
-  // Emergency & Fall Detection States
-  const [isEmergencyActive, setIsEmergencyActive] = useState(false);
+  // Auth State
+  const [isAuthenticated, setIsAuthenticated] = useState(false);
+  const [userData, setUserData] = useState(null);
+  const [isCheckingAuth, setIsCheckingAuth] = useState(true);
+
+  // Detection States
   const [isFallDetectionActive, setIsFallDetectionActive] = useState(false);
-  const [isScreamDetectionActive, setIsScreamDetectionActive] = useState(false); // ✅ NEW STATE
-  const [fallProbability, setFallProbability] = useState(0);
-  const [permissionsGranted, setPermissionsGranted] = useState(false);
-  const [isModelLoaded, setIsModelLoaded] = useState(false); // ✅ NEW: Track model load state
-  const [isModelLoading, setIsModelLoading] = useState(true); // ✅ NEW: Track loading status
-  
-  // Scream Detection State
   const [isScreamDetectionActive, setIsScreamDetectionActive] = useState(false);
+  const [isModelLoaded, setIsModelLoaded] = useState(false);
+  const [isModelLoading, setIsModelLoading] = useState(true);
+
+  // Emergency State
+  const [isEmergencyActive, setIsEmergencyActive] = useState(false);
+  const [emergencyData, setEmergencyData] = useState(null);
+
+  // Network State
+  const [isOnline, setIsOnline] = useState(true);
+  const [offlineCount, setOfflineCount] = useState(0);
+
+  // Permissions
+  const [permissionsGranted, setPermissionsGranted] = useState(false);
 
   useEffect(() => {
-    // Check permissions on mount
-    checkPermissions();
+    initializeApp();
+  }, []);
 
-    // Set up fall detection
-    if (TensorFlowModule) {
-      const eventEmitter = new NativeEventEmitter(TensorFlowModule);
-      
-      // Listen for fall detection events
-      const fallDetectionListener = eventEmitter.addListener(
-        'onFallDetected',
-        (event) => {
-          console.log('🚨 FALL DETECTED EVENT:', event);
-          setFallProbability(event.probability);
-          setIsEmergencyActive(true); // Trigger SOS modal
-        }
-      );
+  const initializeApp = async () => {
+    try {
+      // Check authentication
+      await checkAuthentication();
 
-      // Set up scream detection listener
-      let screamDetectionListener = null;
-      if (ScreamDetectionModule) {
-        const screamEventEmitter = new NativeEventEmitter(ScreamDetectionModule);
-        screamDetectionListener = screamEventEmitter.addListener(
-          'onScreamDetected',
-          (event) => {
-            console.log('🚨 SCREAM DETECTED EVENT:', event);
-            setIsEmergencyActive(true);
-          }
-        );
+      // Check permissions
+      await checkPermissions();
+
+      // Setup network listener
+      setupNetworkListener();
+
+      // Setup app state listener
+      setupAppStateListener();
+
+      // Load ML models if authenticated
+      if (await AuthService.isAuthenticated()) {
+        await loadModels();
+        setupEventListeners();
       }
 
-      // ✅ Load the TensorFlow model on app start with state tracking
+      // Check offline emergencies count
+      const count = await EmergencyManager.getOfflineEmergenciesCount();
+      setOfflineCount(count);
+    } catch (error) {
+      console.error('❌ App initialization error:', error);
+    } finally {
+      setIsCheckingAuth(false);
+    }
+  };
+
+  const checkAuthentication = async () => {
+    try {
+      const isAuth = await AuthService.isAuthenticated();
+      if (isAuth) {
+        const user = await AuthService.getUserData();
+        setUserData(user);
+        setIsAuthenticated(true);
+        console.log('✅ User authenticated:', user.user_id);
+      } else {
+        setIsAuthenticated(false);
+      }
+    } catch (error) {
+      console.error('❌ Auth check error:', error);
+      setIsAuthenticated(false);
+    }
+  };
+
+  const setupNetworkListener = () => {
+    const unsubscribe = NetInfo.addEventListener((state) => {
+      const online = state.isConnected && state.isInternetReachable !== false;
+      setIsOnline(online);
+
+      if (online) {
+        console.log('✅ Back online - syncing data...');
+        syncOfflineData();
+      } else {
+        console.log('⚠️ Offline mode active');
+      }
+    });
+
+    return unsubscribe;
+  };
+
+  const syncOfflineData = async () => {
+    try {
+      const result = await EmergencyManager.syncOfflineEmergencies();
+      if (result.synced > 0) {
+        Alert.alert(
+          '✅ Sync Complete',
+          `Successfully synced ${result.synced} offline emergencies`,
+          [{ text: 'OK' }]
+        );
+      }
+      const count = await EmergencyManager.getOfflineEmergenciesCount();
+      setOfflineCount(count);
+    } catch (error) {
+      console.error('❌ Sync error:', error);
+    }
+  };
+
+  const setupAppStateListener = () => {
+    const subscription = AppState.addEventListener('change', async (nextAppState) => {
+      if (nextAppState === 'active') {
+        await checkPermissions();
+        if (isOnline) {
+          syncOfflineData();
+        }
+      }
+    });
+    return () => subscription.remove();
+  };
+
+  const loadModels = async () => {
+    if (!TensorFlowModule) {
+      console.warn('⚠️ TensorFlow module not available');
+      return;
+    }
+
+    try {
       setIsModelLoading(true);
-      TensorFlowModule.loadFallDetectionModel()
-        .then((result) => {
-          console.log('✅ Model loaded:', result);
-          setIsModelLoaded(true);
-          setIsModelLoading(false);
-        })
-        .catch((error) => {
-          console.error('❌ Model load error:', error);
-          setIsModelLoaded(false);
-          setIsModelLoading(false);
-          Alert.alert(
-            'Model Load Error',
-            `Failed to load fall detection model: ${error.message}\n\nMake sure the model file is in android/app/src/main/assets/models/`
-          );
-        });
-
-      return () => {
-        fallDetectionListener.remove();
-        if (isFallDetectionActive) {
-          TensorFlowModule.stopFallDetection()
-            .catch(err => console.error('Cleanup error:', err));
-        }
-      };
+      await TensorFlowModule.loadFallDetectionModel();
+      setIsModelLoaded(true);
+      console.log('✅ Fall detection model loaded');
+    } catch (error) {
+      console.error('❌ Model load error:', error);
+      setIsModelLoaded(false);
+      Alert.alert(
+        'Model Load Error',
+        'Failed to load AI model. Fall detection may not work properly.',
+        [{ text: 'OK' }]
+      );
+    } finally {
+      setIsModelLoading(false);
     }
-  }, []);
+  };
 
-  // Check permissions
-        if (screamDetectionListener) {
-          screamDetectionListener.remove();
-        }
-      };
+  const setupEventListeners = () => {
+    const listeners = [];
+
+    // Fall Detection
+    if (TensorFlowModule) {
+      const fallEmitter = new NativeEventEmitter(TensorFlowModule);
+      const fallListener = fallEmitter.addListener('onFallDetected', async (event) => {
+        console.log('🚨 FALL DETECTED!', event);
+        await handleEmergency('CRITICAL', 'Fall detected by AI', event);
+      });
+      listeners.push(fallListener);
     }
-  }, []);
 
-  // ✅ CLEAN PERMISSION CHECK - Location and Audio permissions
+    // Scream Detection
+    if (ScreamDetectionModule) {
+      const screamEmitter = new NativeEventEmitter(ScreamDetectionModule);
+      const screamListener = screamEmitter.addListener('onScreamDetected', async (event) => {
+        console.log('🚨 SCREAM DETECTED!', event);
+        await handleEmergency('CRITICAL', 'Scream/distress sound detected', event);
+      });
+      listeners.push(screamListener);
+    }
+
+    // Mesh Data Received (from another miner)
+    if (OfflineCommModule) {
+      const meshEmitter = new NativeEventEmitter(OfflineCommModule);
+      const meshListener = meshEmitter.addListener('onMeshDataReceived', async (data) => {
+        console.log('📡 Mesh data received:', data);
+        await forwardMeshDataToServer(data);
+      });
+      listeners.push(meshListener);
+    }
+
+    return () => {
+      listeners.forEach((listener) => listener.remove());
+    };
+  };
+
+  const handleEmergency = async (severity, issue, eventData = null) => {
+    try {
+      setEmergencyData({ severity, issue, eventData });
+      setIsEmergencyActive(true);
+
+      const result = await EmergencyManager.triggerEmergency(severity, issue);
+
+      if (result.success) {
+        Alert.alert(
+          '🚨 Emergency Alert Sent',
+          `Method: ${result.method.toUpperCase()}\nHelp is on the way!`,
+          [{ text: 'OK' }]
+        );
+      } else if (result.method === 'stored') {
+        Alert.alert(
+          '⚠️ Emergency Stored',
+          'No connection available. Emergency will be sent when online.',
+          [{ text: 'OK' }]
+        );
+        setOfflineCount((prev) => prev + 1);
+      }
+    } catch (error) {
+      console.error('❌ Emergency handling error:', error);
+      Alert.alert('Error', 'Failed to send emergency alert. Please try manual SOS.');
+    }
+  };
+
+  const forwardMeshDataToServer = async (meshData) => {
+    try {
+      if (!isOnline) {
+        console.log('⚠️ Offline - cannot forward mesh data');
+        return;
+      }
+
+      const token = await AuthService.getToken();
+      const response = await fetch(`${API_CONFIG.BASE_URL}/emergencies/mesh`, {
+        method: 'POST',
+        headers: {
+          'Content-Type': 'application/json',
+          Authorization: `Bearer ${token}`,
+        },
+        body: meshData,
+      });
+
+      if (response.ok) {
+        console.log('✅ Mesh data forwarded to server');
+      }
+    } catch (error) {
+      console.error('❌ Forward mesh data error:', error);
+    }
+  };
+
   const checkPermissions = async () => {
     if (Platform.OS !== 'android') {
       setPermissionsGranted(true);
@@ -120,29 +279,21 @@ export default function App() {
     }
 
     try {
-      // Check location and audio permissions
-      const fineLocation = await PermissionsAndroid.check(
-        PermissionsAndroid.PERMISSIONS.ACCESS_FINE_LOCATION
-      );
-      
-      const audio = await PermissionsAndroid.check(
-        PermissionsAndroid.PERMISSIONS.RECORD_AUDIO
-      );
+      const results = await Promise.all([
+        PermissionsAndroid.check(PermissionsAndroid.PERMISSIONS.ACCESS_FINE_LOCATION),
+        PermissionsAndroid.check(PermissionsAndroid.PERMISSIONS.RECORD_AUDIO),
+        PermissionsAndroid.check(PermissionsAndroid.PERMISSIONS.BLUETOOTH_SCAN),
+        PermissionsAndroid.check(PermissionsAndroid.PERMISSIONS.BLUETOOTH_CONNECT),
+      ]);
 
-      if (fineLocation && audio) {
-        console.log('✅ All permissions granted - Detection ready!');
-        setPermissionsGranted(true);
-      } else {
-        console.log('⚠️ Permissions missing - Location:', fineLocation, 'Audio:', audio);
-        setPermissionsGranted(false);
-      }
-    } catch (err) {
-      console.error('Permission check error:', err);
+      const allGranted = results.every((result) => result);
+      setPermissionsGranted(allGranted);
+    } catch (error) {
+      console.error('❌ Permission check error:', error);
       setPermissionsGranted(false);
     }
   };
 
-  // Request permissions
   const requestPermissions = async () => {
     if (Platform.OS !== 'android') {
       setPermissionsGranted(true);
@@ -150,405 +301,221 @@ export default function App() {
     }
 
     try {
-      console.log('📋 Requesting permissions...');
-
-      // Request Location and Audio permissions
       const granted = await PermissionsAndroid.requestMultiple([
         PermissionsAndroid.PERMISSIONS.ACCESS_FINE_LOCATION,
-        PermissionsAndroid.PERMISSIONS.ACCESS_COARSE_LOCATION,
-        PermissionsAndroid.PERMISSIONS.ACTIVITY_RECOGNITION,
         PermissionsAndroid.PERMISSIONS.RECORD_AUDIO,
+        PermissionsAndroid.PERMISSIONS.BLUETOOTH_SCAN,
+        PermissionsAndroid.PERMISSIONS.BLUETOOTH_CONNECT,
+        PermissionsAndroid.PERMISSIONS.BLUETOOTH_ADVERTISE,
       ]);
 
-      console.log('Permission results:', granted);
+      const allGranted = Object.values(granted).every(
+        (status) => status === PermissionsAndroid.RESULTS.GRANTED
+      );
 
-      // Check if required permissions granted
-      const locationGranted = 
-        granted[PermissionsAndroid.PERMISSIONS.ACCESS_FINE_LOCATION] === PermissionsAndroid.RESULTS.GRANTED;
-      
-      const audioGranted = 
-        granted[PermissionsAndroid.PERMISSIONS.RECORD_AUDIO] === PermissionsAndroid.RESULTS.GRANTED;
+      setPermissionsGranted(allGranted);
 
-      if (locationGranted && audioGranted) {
-        setPermissionsGranted(true);
-        Alert.alert(
-          '✅ Permissions Granted',
-          '📍 Location permission granted\n' +
-          '🎤 Audio permission granted\n' +
-          '📊 Sensors are always available!\n\n' +
-          'All detection features are ready to use!',
-          [{ text: 'OK' }]
-        );
+      if (allGranted) {
+        Alert.alert('✅ Permissions Granted', 'All features are now available!');
       } else {
-        setPermissionsGranted(false);
-
-        const missingPerms = [];
-        if (!locationGranted) missingPerms.push('📍 Location');
-        if (!audioGranted) missingPerms.push('🎤 Audio');
-
         Alert.alert(
-          '⚠️ Permissions Required',
-          `${missingPerms.join('\n')} permission(s) needed for full functionality.\n\n` +
-          '📊 Motion sensors are always available!',
-          [
-            { text: 'Cancel', style: 'cancel' },
-            { 
-              text: 'Open Settings', 
-              onPress: () => {
-                if (OpenSettings?.openSettings) {
-                  OpenSettings.openSettings();
-                } else {
-                  Linking.openSettings();
-                }
-              }
-            }
-          ]
+          '⚠️ Some Permissions Missing',
+          'Some features may not work properly without all permissions.'
         );
       }
-    } catch (err) {
-      console.error('❌ Permission error:', err);
-      Alert.alert('Error', `Failed to request permissions: ${err.message}`);
+    } catch (error) {
+      console.error('❌ Permission request error:', error);
     }
   };
 
-  // ✅ OPEN SETTINGS FUNCTION
-  const openSettings = () => {
-    if (OpenSettings && OpenSettings.openSettings) {
-      console.log('📱 Opening app settings via native module...');
-      OpenSettings.openSettings();
-    } else {
-      console.log('📱 Opening settings via Linking...');
-      Linking.openSettings();
-    }
-  };
-
-  // ✅ TOGGLE FALL DETECTION WITH MODEL CHECK
   const handleToggleFallDetection = async () => {
-    if (!TensorFlowModule) {
-      Alert.alert('Error', 'Fall detection module not available');
-      return;
-    }
+    if (!TensorFlowModule || !isModelLoaded || !userData) return;
 
-    // ✅ Check if model is loaded
-    if (!isModelLoaded) {
-      Alert.alert(
-        '⚠️ Model Not Ready',
-        'Fall detection model is still loading. Please wait...',
-        [
-          { text: 'OK' }
-        ]
-      );
-      return;
-    }
-
-    // Check permissions before starting
-    if (!permissionsGranted) {
-      Alert.alert(
-        '⚠️ Permission Required',
-        'Fall detection needs location permission for emergency alerts.\n\nWould you like to grant permission now?',
-        [
-          { text: 'Cancel', style: 'cancel' },
-          { text: 'Grant Permission', onPress: requestPermissions }
-        ]
-      );
-      return;
-    }
-
-    // Toggle state
-    if (!isFallDetectionActive) {
-      // START
-      TensorFlowModule.startFallDetection()
-        .then(() => {
-          console.log('✅ Fall detection started');
-          setIsFallDetectionActive(true);
-        })
-        .catch((error) => {
-          console.error('❌ Start error:', error);
-          Alert.alert('Error', `Failed to start: ${error.message}`);
-        });
-    } else {
-      // STOP
-      TensorFlowModule.stopFallDetection()
-        .then(() => {
-          console.log('✅ Fall detection stopped');
-          setIsFallDetectionActive(false);
-          setFallProbability(0);
-        })
-        .catch((error) => {
-          console.error('❌ Stop error:', error);
-          Alert.alert('Error', `Failed to stop: ${error.message}`);
-        });
-    }
-  };
-
-  // ✅ TOGGLE SCREAM DETECTION
-  const handleToggleScreamDetection = async () => {
-    if (!ScreamDetectionModule) {
-      Alert.alert('Error', 'Scream detection module not available');
-      return;
-    }
-
-    // Check permissions before starting
     if (!permissionsGranted) {
       Alert.alert(
         '⚠️ Permissions Required',
-        'Scream detection needs:\n\n' +
-        '🎤 Microphone - To listen for distress sounds\n' +
-        '📍 Location - To send your GPS coordinates in emergency alerts',
+        'Location permission is needed for emergency alerts.',
         [
           { text: 'Cancel', style: 'cancel' },
-          { text: 'Grant Permission', onPress: requestPermissions }
+          { text: 'Grant', onPress: requestPermissions },
         ]
       );
       return;
     }
 
-    // START or STOP scream detection
-    if (!isScreamDetectionActive) {
-      // START
-      ScreamDetectionModule.startScreamDetection()
-        .then(() => {
-          console.log('✅ Scream detection started');
-          setIsScreamDetectionActive(true);
-        })
-        .catch((error) => {
-          console.error('❌ Start error:', error);
-          Alert.alert('Error', `Failed to start scream detection: ${error.message}`);
-        });
-    } else {
-      // STOP
-      ScreamDetectionModule.stopScreamDetection()
-        .then(() => {
-          console.log('✅ Scream detection stopped');
-          setIsScreamDetectionActive(false);
-        })
-        .catch((error) => {
-          console.error('❌ Stop error:', error);
-          Alert.alert('Error', `Failed to stop scream detection: ${error.message}`);
-        });
+    try {
+      if (!isFallDetectionActive) {
+        await TensorFlowModule.startFallDetection();
+        setIsFallDetectionActive(true);
+        console.log('✅ Fall detection started');
+      } else {
+        await TensorFlowModule.stopFallDetection();
+        setIsFallDetectionActive(false);
+        console.log('🛑 Fall detection stopped');
+      }
+    } catch (error) {
+      console.error('❌ Toggle fall detection error:', error);
+      Alert.alert('Error', error.message);
     }
   };
 
-  // ✅ NEW FUNCTION: Toggle scream detection
-  const handleToggleScreamDetection = () => {
-    if (!isScreamDetectionActive) {
-      // START scream detection
-      setIsScreamDetectionActive(true);
-      console.log('🎤 Scream detection started');
+  const handleToggleScreamDetection = async () => {
+    if (!ScreamDetectionModule || !userData) return;
+
+    if (!permissionsGranted) {
       Alert.alert(
-        '✅ Scream Detection Active',
-        '🎤 Microphone is now monitoring for screams\n\n' +
-        '🔊 Audio analysis enabled\n' +
-        '🚨 Emergency alert on scream detection\n\n' +
-        'If a scream is detected, emergency alert will trigger.',
-        [{ text: 'Got it!' }]
+        '⚠️ Permissions Required',
+        'Microphone permission is needed for scream detection.',
+        [
+          { text: 'Cancel', style: 'cancel' },
+          { text: 'Grant', onPress: requestPermissions },
+        ]
       );
-    } else {
-      // STOP scream detection
-      setIsScreamDetectionActive(false);
-      console.log('🛑 Scream detection stopped');
-      Alert.alert('🛑 Stopped', 'Scream detection has been disabled.');
+      return;
+    }
+
+    try {
+      if (!isScreamDetectionActive) {
+        await ScreamDetectionModule.startScreamDetection();
+        setIsScreamDetectionActive(true);
+        console.log('✅ Scream detection started');
+      } else {
+        await ScreamDetectionModule.stopScreamDetection();
+        setIsScreamDetectionActive(false);
+        console.log('🛑 Scream detection stopped');
+      }
+    } catch (error) {
+      console.error('❌ Toggle scream detection error:', error);
+      Alert.alert('Error', error.message);
     }
   };
 
-  const handleCancelEmergency = () => {
-    setIsEmergencyActive(false);
-    setFallProbability(0);
+  const handleLogout = async () => {
+    Alert.alert('Logout', 'Are you sure you want to logout?', [
+      { text: 'Cancel', style: 'cancel' },
+      {
+        text: 'Logout',
+        style: 'destructive',
+        onPress: async () => {
+          // Stop all detection
+          if (isFallDetectionActive && TensorFlowModule) {
+            await TensorFlowModule.stopFallDetection().catch(console.error);
+          }
+          if (isScreamDetectionActive && ScreamDetectionModule) {
+            await ScreamDetectionModule.stopScreamDetection().catch(console.error);
+          }
+
+          // Logout
+          await AuthService.logout();
+          setIsAuthenticated(false);
+          setUserData(null);
+          setIsFallDetectionActive(false);
+          setIsScreamDetectionActive(false);
+        },
+      },
+    ]);
   };
+
+  if (isCheckingAuth) {
+    return (
+      <View style={styles.loadingContainer}>
+        <ActivityIndicator size="large" color={colors.primary} />
+        <Text style={styles.loadingText}>Loading...</Text>
+      </View>
+    );
+  }
 
   return (
     <NavigationContainer>
       <SafeAreaView style={styles.container}>
         <StatusBar barStyle="light-content" backgroundColor="#000000" />
 
-        {/* Permission Warning Banner */}
-        {!permissionsGranted && (
-          <TouchableOpacity 
-            style={styles.permissionBanner}
-            onPress={requestPermissions}
-            activeOpacity={0.8}
-          >
-            <View style={{ flex: 1 }}>
-              <Text style={styles.permissionTitle}>⚠️ Location Permission Required</Text>
-              <Text style={styles.permissionSubtitle}>
-                Tap to grant permission for emergency alerts
-              </Text>
-            </View>
-            <Text style={styles.permissionArrow}>→</Text>
+        {/* Online/Offline Indicator */}
+        {!isOnline && (
+          <View style={styles.offlineBanner}>
+            <Text style={styles.offlineText}>
+              ⚠️ Offline Mode - Using BLE Mesh
+              {offlineCount > 0 && ` • ${offlineCount} pending`}
+            </Text>
+          </View>
+        )}
+
+        {/* Permissions Banner */}
+        {isAuthenticated && !permissionsGranted && (
+          <TouchableOpacity style={styles.permissionBanner} onPress={requestPermissions}>
+            <Text style={styles.permissionText}>
+              ⚠️ Tap to grant permissions for full functionality
+            </Text>
           </TouchableOpacity>
         )}
 
-        {/* Model Loading Banner */}
-        {isModelLoading && (
+        {/* Model Loading */}
+        {isAuthenticated && isModelLoading && (
           <View style={styles.modelLoadingBanner}>
             <ActivityIndicator size="small" color="#ffffff" />
             <Text style={styles.modelLoadingText}>Loading AI model...</Text>
           </View>
         )}
 
-      {/* ✅ PERMISSION WARNING BANNER */}
-      {!permissionsGranted && (
-        <TouchableOpacity 
-          style={styles.permissionBanner}
-          onPress={requestPermissions}
-          activeOpacity={0.8}
-        >
-          <View style={{ flex: 1 }}>
-            <Text style={styles.permissionTitle}>⚠️ Location Permission Required</Text>
-            <Text style={styles.permissionSubtitle}>
-              Tap to grant Location (sensors always available!)
-            </Text>
-            {isFallDetectionActive && (
-              <Text style={styles.statusSubtext}>
-                🧠 AI Active • 📊 50Hz Monitoring
+        {/* Detection Controls */}
+        {isAuthenticated && (
+          <>
+            <View style={styles.detectionBar}>
+              <Text style={styles.detectionText}>
+                {isFallDetectionActive ? '🟢 Fall: ON' : '⚪ Fall: OFF'}
               </Text>
-            )}
-            {!isModelLoaded && !isModelLoading && (
-              <Text style={styles.statusError}>❌ Model failed to load</Text>
-            )}
-          </View>
-          <Text style={styles.permissionArrow}>→</Text>
-        </TouchableOpacity>
-      )}
+              <TouchableOpacity
+                style={[styles.toggleBtn, isFallDetectionActive && styles.toggleBtnActive]}
+                onPress={handleToggleFallDetection}
+                disabled={!isModelLoaded}
+              >
+                <Text style={styles.toggleBtnText}>
+                  {isFallDetectionActive ? '⏹' : '▶'}
+                </Text>
+              </TouchableOpacity>
+            </View>
 
-      {/* ✅ MODEL LOADING BANNER */}
-      {isModelLoading && (
-        <View style={styles.modelLoadingBanner}>
-          <ActivityIndicator size="small" color="#ffffff" />
-          <Text style={styles.modelLoadingText}>Loading fall detection model...</Text>
-        </View>
-      )}
-
-      {/* Fall Detection Toggle Bar */}
-      <View style={styles.fallDetectionBar}>
-        <View style={styles.statusContainer}>
-          <Text style={styles.fallDetectionText}>
-            {isFallDetectionActive ? '🟢 Fall Detection: ON' : '⚪ Fall Detection: OFF'}
-          </Text>
-          {isFallDetectionActive && (
-            <Text style={styles.statusSubtext}>
-              🧠 CNN Active • 📊 50Hz Sampling
-            </Text>
-          )}
-          {!isModelLoaded && !isModelLoading && (
-            <Text style={styles.statusError}>
-              ❌ Model failed to load
-            </Text>
-          </TouchableOpacity>
-        </View>
-        <TouchableOpacity 
-          style={[
-            styles.toggleButton,
-            isFallDetectionActive ? styles.toggleButtonActive : styles.toggleButtonInactive,
-            (!permissionsGranted || !isModelLoaded) && styles.toggleButtonDisabled
-          ]}
-          onPress={handleToggleFallDetection}
-          disabled={!isModelLoaded || isModelLoading}
-        >
-          <Text style={styles.toggleButtonText}>
-            {isFallDetectionActive ? '⏹ STOP' : '▶ START'}
-          </Text>
-        </TouchableOpacity>
-      </View>
-
-      {/* Scream Detection Toggle Bar */}
-      <View style={styles.screamDetectionBar}>
-        <View style={styles.statusContainer}>
-          <Text style={styles.screamDetectionText}>
-            {isScreamDetectionActive ? '🟢 Scream Detection: ON' : '⚪ Scream Detection: OFF'}
-          </Text>
-          {isScreamDetectionActive && (
-            <Text style={styles.statusSubtext}>
-              🎤 Audio Monitoring • 🧠 TFLite MFCC
-            </Text>
-          )}
-        </View>
-        <TouchableOpacity 
-          style={[
-            styles.toggleButton,
-            isScreamDetectionActive ? styles.toggleButtonActive : styles.toggleButtonInactive,
-            !permissionsGranted && styles.toggleButtonDisabled
-          ]}
-          onPress={handleToggleScreamDetection}
-          disabled={!permissionsGranted}
-        >
-          <Text style={styles.toggleButtonText}>
-            {isScreamDetectionActive ? '⏹ STOP' : '▶ START'}
-          </Text>
-        </TouchableOpacity>
-      </View>
-
-      {/* Main Content */}
-      {renderScreen()}
-
-        {/* ✅ NEW: Scream Detection Toggle Bar */}
-        <View style={styles.screamDetectionBar}>
-          <View style={styles.statusContainer}>
-            <Text style={styles.screamDetectionText}>
-              {isScreamDetectionActive ? '🟢 Scream Detection: ON' : '⚪ Scream Detection: OFF'}
-            </Text>
-            {isScreamDetectionActive && (
-              <Text style={styles.statusSubtext}>
-                🎤 Microphone Active • 🔊 Audio Monitoring
+            <View style={styles.detectionBar}>
+              <Text style={styles.detectionText}>
+                {isScreamDetectionActive ? '🟢 Scream: ON' : '⚪ Scream: OFF'}
               </Text>
-            )}
-          </View>
-          
-          <TouchableOpacity 
-            style={[
-              styles.toggleButton,
-              isScreamDetectionActive ? styles.toggleButtonActive : styles.toggleButtonInactive,
-            ]}
-            onPress={handleToggleScreamDetection}
-          >
-            <Text style={styles.toggleButtonText}>
-              {isScreamDetectionActive ? '⏹ STOP' : '▶ START'}
-            </Text>
-          </TouchableOpacity>
-        </View>
+              <TouchableOpacity
+                style={[styles.toggleBtn, isScreamDetectionActive && styles.toggleBtnActive]}
+                onPress={handleToggleScreamDetection}
+              >
+                <Text style={styles.toggleBtnText}>
+                  {isScreamDetectionActive ? '⏹' : '▶'}
+                </Text>
+              </TouchableOpacity>
+            </View>
+          </>
+        )}
 
-        {/* Navigation Stack */}
-        <Stack.Navigator 
-          initialRouteName="Splash"
-          screenOptions={{
-            headerShown: false,
-            contentStyle: { backgroundColor: '#121212' },
-            animation: 'slide_from_right',
-          }}
+        <Stack.Navigator
+          initialRouteName={isAuthenticated ? 'Home' : 'Login'}
+          screenOptions={{ headerShown: false }}
         >
-          <Stack.Screen name="Splash" component={SplashScreen} />
-          <Stack.Screen name="Onboarding" component={OnboardingScreen} />
-          <Stack.Screen name="LanguageSelection" component={LanguageSelectionScreen} />
-          <Stack.Screen name="Home" component={HomeScreen} />
+          <Stack.Screen name="Login" component={LoginScreen} />
+          <Stack.Screen name="Home">
+            {(props) => <HomeScreen {...props} userData={userData} onLogout={handleLogout} />}
+          </Stack.Screen>
           <Stack.Screen name="SOS" component={SOSScreen} />
           <Stack.Screen name="Chatbot" component={ChatbotScreen} />
           <Stack.Screen name="ReportHazard" component={ReportHazardScreen} />
           <Stack.Screen name="HazardDetails" component={HazardDetailsScreen} />
+          <Stack.Screen name="ReviewReport" component={ReviewReportScreen} />
           <Stack.Screen name="TrainingModule" component={TrainingModuleScreen} />
-          <Stack.Screen name="WorkerProfile" component={WorkerProfileScreen} />
+          <Stack.Screen name="WorkerProfile">
+            {(props) => (
+              <WorkerProfileScreen {...props} userData={userData} onLogout={handleLogout} />
+            )}
+          </Stack.Screen>
         </Stack.Navigator>
 
-        {/* Emergency Alert Modal - Triggered by Fall Detection */}
-        <Modal
-          visible={isEmergencyActive}
-          animationType="slide"
-          transparent={false}
-          onRequestClose={handleCancelEmergency}
-        >
-          <SOSScreen 
-            navigation={{ 
-              goBack: handleCancelEmergency,
-              replace: (screen) => {
-                setIsEmergencyActive(false);
-              }
-            }}
-            route={{
-              params: {
-                fallDetected: true,
-                fallProbability: fallProbability,
-                autoTriggered: true,
-              }
-            }}
+        <Modal visible={isEmergencyActive} animationType="slide">
+          <SOSScreen
+            navigation={{ goBack: () => setIsEmergencyActive(false) }}
+            route={{ params: { autoTriggered: true, ...emergencyData } }}
           />
         </Modal>
       </SafeAreaView>
@@ -557,33 +524,22 @@ export default function App() {
 }
 
 const styles = StyleSheet.create({
-  container: {
+  container: { flex: 1, backgroundColor: '#121212' },
+  loadingContainer: {
     flex: 1,
-    backgroundColor: '#121212',
-  },
-  permissionBanner: {
-    backgroundColor: '#ff9800',
-    paddingHorizontal: 15,
-    paddingVertical: 12,
-    flexDirection: 'row',
+    justifyContent: 'center',
     alignItems: 'center',
-    justifyContent: 'space-between',
+    backgroundColor: colors.white,
   },
-  permissionTitle: {
-    color: '#fff',
-    fontSize: 14,
-    fontWeight: 'bold',
+  loadingText: {
+    marginTop: 16,
+    fontSize: 16,
+    color: colors.text.secondary,
   },
-  permissionSubtitle: {
-    color: 'rgba(255,255,255,0.9)',
-    fontSize: 11,
-    marginTop: 2,
-  },
-  permissionArrow: {
-    color: '#fff',
-    fontSize: 24,
-    fontWeight: 'bold',
-  },
+  offlineBanner: { backgroundColor: '#ff9800', padding: 12 },
+  offlineText: { color: '#fff', textAlign: 'center', fontWeight: '600', fontSize: 13 },
+  permissionBanner: { backgroundColor: '#f44336', padding: 12 },
+  permissionText: { color: '#fff', textAlign: 'center', fontWeight: '600', fontSize: 13 },
   modelLoadingBanner: {
     backgroundColor: '#2196F3',
     paddingHorizontal: 15,
@@ -592,94 +548,24 @@ const styles = StyleSheet.create({
     alignItems: 'center',
     gap: 10,
   },
-  modelLoadingText: {
-    color: '#fff',
-    fontSize: 13,
-    fontWeight: '600',
-  },
-  fallDetectionBar: {
+  modelLoadingText: { color: '#fff', fontSize: 13, fontWeight: '600' },
+  detectionBar: {
     flexDirection: 'row',
-    alignItems: 'center',
     justifyContent: 'space-between',
+    alignItems: 'center',
     backgroundColor: '#1a1a1a',
     paddingHorizontal: 15,
     paddingVertical: 10,
     borderBottomWidth: 1,
     borderBottomColor: '#333',
   },
-  screamDetectionBar: {
-    flexDirection: 'row',
-    alignItems: 'center',
-    justifyContent: 'space-between',
-    backgroundColor: '#1a1a1a',
-    paddingHorizontal: 15,
-    paddingVertical: 10,
-    borderBottomWidth: 1,
-    borderBottomColor: '#333',
-  },
-  statusContainer: {
-    flex: 1,
-  },
-  fallDetectionText: {
-    color: '#ffffff',
-    fontSize: 14,
-    fontWeight: 'bold',
-    marginBottom: 2,
-  },
-  screamDetectionText: {
-    color: '#ffffff',
-    fontSize: 14,
-    fontWeight: 'bold',
-    marginBottom: 2,
-  },
-  statusSubtext: {
-    color: '#999',
-    fontSize: 10,
-    fontWeight: '500',
-  },
-  statusError: {
-    color: '#ff5722',
-    fontSize: 10,
-    fontWeight: '500',
-  },
-  toggleButton: {
+  detectionText: { color: '#fff', fontSize: 14, fontWeight: 'bold' },
+  toggleBtn: {
     paddingHorizontal: 20,
     paddingVertical: 8,
     borderRadius: 20,
-    minWidth: 80,
-    alignItems: 'center',
-  },
-  toggleButtonActive: {
-    backgroundColor: '#ff5722',
-  },
-  toggleButtonInactive: {
     backgroundColor: '#4caf50',
   },
-  toggleButtonText: {
-    color: '#ffffff',
-    fontSize: 12,
-    fontWeight: 'bold',
-  },
-  toggleButtonDisabled: {
-    opacity: 0.5,
-  },
-  // ✅ NEW STYLES
-  modelLoadingBanner: {
-    backgroundColor: '#2196F3',
-    paddingHorizontal: 15,
-    paddingVertical: 10,
-    flexDirection: 'row',
-    alignItems: 'center',
-    gap: 10,
-  },
-  modelLoadingText: {
-    color: '#fff',
-    fontSize: 13,
-    fontWeight: '600',
-  },
-  statusError: {
-    color: '#ff5722',
-    fontSize: 10,
-    fontWeight: '500',
-  },
+  toggleBtnActive: { backgroundColor: '#ff5722' },
+  toggleBtnText: { color: '#fff', fontSize: 12, fontWeight: 'bold' },
 });
