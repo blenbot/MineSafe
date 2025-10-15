@@ -5,7 +5,7 @@ import { View, Text, StyleSheet, TouchableOpacity } from 'react-native';
 import colors from '../utils/colors';
 
 const SOSScreen = ({ navigation }) => {
-  const [countdown, setCountdown] = useState(3);
+  const [countdown, setCountdown] = useState(180);
   const [alertSent, setAlertSent] = useState(false);
 
   useEffect(() => {

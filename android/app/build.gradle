@@ -117,9 +117,14 @@ dependencies {
         implementation jscFlavor
     }
     
-    // TensorFlow Lite for ML
-    implementation 'org.tensorflow:tensorflow-lite:2.14.0'
-    implementation 'org.tensorflow:tensorflow-lite-support:0.4.4'
+    // ✅ NEW LiteRT (TensorFlow Lite)
+    implementation "com.google.ai.edge.litert:litert:1.0.1"
+    
+    // ✅ TensorFlow Lite Support - EXCLUDE old tensorflow-lite
+    implementation('org.tensorflow:tensorflow-lite-support:0.4.4') {
+        exclude group: 'org.tensorflow', module: 'tensorflow-lite'
+        exclude group: 'org.tensorflow', module: 'tensorflow-lite-api'
+    }
     
     // OkHttp for network requests
     implementation 'com.squareup.okhttp3:okhttp:4.12.0'
