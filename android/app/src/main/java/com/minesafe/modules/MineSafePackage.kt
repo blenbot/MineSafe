@@ -26,3 +26,4 @@ class MineSafePackage : ReactPackage {
         return modules
     }
 }
+
