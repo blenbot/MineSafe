@@ -1,5 +1,5 @@
 import AsyncStorage from '@react-native-async-storage/async-storage';
-import API_CONFIG from '../config/api';
+import API_CONFIG from '../../config/api';
 
 class AuthService {
   /**

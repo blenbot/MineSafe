@@ -29,11 +29,27 @@ class ScreamDetectionModule(reactContext: ReactApplicationContext) :
     }
 
     init {
-        // Register broadcast receiver
+        // Register broadcast receiver safely (Android 13+ requires explicit exported flag)
         val filter = IntentFilter("com.minesafe.SCREAM_DETECTED")
-        reactApplicationContext.registerReceiver(screamReceiver, filter)
-        Log.d(TAG, "📡 Broadcast receiver registered")
+
+        try {
+            if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.TIRAMISU) {
+                // API 33+ -> explicitly specify receiver is NOT exported (only app-internal broadcasts)
+                reactApplicationContext.registerReceiver(
+                    screamReceiver,
+                    filter,
+                    Context.RECEIVER_NOT_EXPORTED
+                )
+            } else {
+                // Older APIs
+                reactApplicationContext.registerReceiver(screamReceiver, filter)
+            }
+            Log.d(TAG, "📡 Broadcast receiver registered")
+        } catch (e: Exception) {
+            Log.e(TAG, "❌ Failed to register broadcast receiver", e)
+        }
     }
+
 
     override fun getName(): String = "ScreamDetectionModule"
 

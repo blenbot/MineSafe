@@ -9,20 +9,14 @@ import android.util.Log
 import com.minesafe.mesh.EmergencyPayload
 import com.minesafe.services.MineSafeMeshService
 
-/**
- * A clean bridge for the main application to interact with the BLE mesh service.
- * This is a Singleton object, making it easy to access from anywhere.
- */
 object BLEMeshBridge {
-    private val TAG = "BLEMeshBridge"
+    private const val TAG = "BLEMeshBridge"
     private var isInitialized = false
 
-    /**
-     * Starts the mesh service. Call this after permissions are granted.
-     * @param context The application context.
-     * @param minerId The ID of the current user.
-     * @param onDataReadyForServer The callback function to execute when a packet is ready for server upload.
-     */
+    // Keep references so we can unregister later
+    private var gatewayReceiver: BroadcastReceiver? = null
+    private var isReceiverRegistered: Boolean = false
+
     fun start(
         context: Context,
         minerId: String,
@@ -32,10 +26,10 @@ object BLEMeshBridge {
             Log.w(TAG, "Bridge is already initialized.")
             return
         }
-        
-        // Register a broadcast receiver to get data from the service
-        val gatewayReceiver = object : BroadcastReceiver() {
-            override fun onReceive(context: Context?, intent: Intent?) {
+
+        // Create receiver once and hold reference
+        gatewayReceiver = object : BroadcastReceiver() {
+            override fun onReceive(ctx: Context?, intent: Intent?) {
                 if (intent?.action == MineSafeMeshService.ACTION_GATEWAY_DATA_READY) {
                     intent.getStringExtra(MineSafeMeshService.EXTRA_PAYLOAD_JSON)?.let {
                         onDataReadyForServer(it)
@@ -43,41 +37,84 @@ object BLEMeshBridge {
                 }
             }
         }
+
         val filter = IntentFilter(MineSafeMeshService.ACTION_GATEWAY_DATA_READY)
 
-        if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.TIRAMISU) {
-            context.registerReceiver(gatewayReceiver, filter, Context.RECEIVER_EXPORTED)
-        } else {
-            context.registerReceiver(gatewayReceiver, filter)
+        try {
+            // Register receiver with Android 13+ flags
+            if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.TIRAMISU) {
+                // Use NOT_EXPORTED for internal-only broadcasts (safer)
+                context.applicationContext.registerReceiver(
+                    gatewayReceiver,
+                    filter,
+                    Context.RECEIVER_NOT_EXPORTED
+                )
+            } else {
+                context.applicationContext.registerReceiver(gatewayReceiver, filter)
+            }
+            isReceiverRegistered = true
+            Log.d(TAG, "📡 Broadcast receiver registered")
+        } catch (e: Exception) {
+            Log.e(TAG, "❌ Failed to register gateway receiver", e)
+            // continue — we might still want to start the service even if receiver failed
         }
 
-
-        // Start the background service
-        val intent = Intent(context, MineSafeMeshService::class.java).apply {
+        // Start the background service (use startForegroundService on O+ if needed)
+        val intent = Intent(context.applicationContext, MineSafeMeshService::class.java).apply {
             action = MineSafeMeshService.ACTION_START
             putExtra(MineSafeMeshService.EXTRA_MINER_ID, minerId)
         }
-        context.startService(intent)
-        isInitialized = true
-        Log.i(TAG, "BLE Mesh Bridge started.")
+
+        try {
+            if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.O) {
+                context.applicationContext.startForegroundService(intent)
+            } else {
+                context.applicationContext.startService(intent)
+            }
+            isInitialized = true
+            Log.i(TAG, "BLE Mesh Bridge started.")
+        } catch (e: Exception) {
+            Log.e(TAG, "❌ Failed to start MeshService", e)
+            // If service failed to start, unregister receiver to keep consistent state
+            cleanupReceiver(context)
+        }
     }
 
-    /**
-     * Stops the mesh service.
-     */
     fun stop(context: Context) {
-        if (!isInitialized) return
-        val intent = Intent(context, MineSafeMeshService::class.java).apply {
+        // Stop the service
+        val intent = Intent(context.applicationContext, MineSafeMeshService::class.java).apply {
             action = MineSafeMeshService.ACTION_STOP
         }
-        context.startService(intent)
+        try {
+            context.applicationContext.startService(intent) // Stop usually uses stopService but using startService for intent-driven service is OK if service handles ACTION_STOP
+        } catch (e: Exception) {
+            Log.w(TAG, "Warning: failed to send stop intent", e)
+        }
+
+        // Unregister the receiver
+        cleanupReceiver(context)
+
         isInitialized = false
         Log.i(TAG, "BLE Mesh Bridge stopped.")
     }
 
-    /**
-     * The main function your app calls when an emergency is detected.
-     */
+    private fun cleanupReceiver(context: Context) {
+        try {
+            if (isReceiverRegistered && gatewayReceiver != null) {
+                context.applicationContext.unregisterReceiver(gatewayReceiver)
+                Log.d(TAG, "📡 Broadcast receiver unregistered")
+            }
+        } catch (e: IllegalArgumentException) {
+            // Already unregistered
+            Log.w(TAG, "Receiver already unregistered or never registered", e)
+        } catch (e: Exception) {
+            Log.e(TAG, "Error while unregistering receiver", e)
+        } finally {
+            gatewayReceiver = null
+            isReceiverRegistered = false
+        }
+    }
+
     fun triggerEmergency(
         context: Context,
         minerId: String,
@@ -98,10 +135,14 @@ object BLEMeshBridge {
             issue = issue,
             incident_time = EmergencyPayload.createTimestamp()
         )
-        val intent = Intent(context, MineSafeMeshService::class.java).apply {
+        val intent = Intent(context.applicationContext, MineSafeMeshService::class.java).apply {
             action = MineSafeMeshService.ACTION_TRIGGER_EMERGENCY
             putExtra(MineSafeMeshService.EXTRA_EMERGENCY_PAYLOAD, payload as java.io.Serializable)
         }
-        context.startService(intent)
+        try {
+            context.applicationContext.startService(intent)
+        } catch (e: Exception) {
+            Log.e(TAG, "❌ Failed to send emergency intent", e)
+        }
     }
 }
