@@ -1,342 +1,417 @@
 """
-SCREAM DETECTOR - SIMPLIFIED TESTER
-Quick test and exit
+Improved Scream Detection Testing
+Better feature extraction matching the improved training
 """
 
-import os
-import wave
-import pickle
 import numpy as np
+import librosa
+import sounddevice as sd
+import soundfile as sf
+import tensorflow as tf
+from tensorflow import keras
+import os
+import time
 from pathlib import Path
-import sys
+import warnings
+warnings.filterwarnings('ignore')
 
-# Try to import pydub for MP3/MP4 support
-try:
-    from pydub import AudioSegment
-    PYDUB_AVAILABLE = True
-except ImportError:
-    AudioSegment = None
-    PYDUB_AVAILABLE = False
+# Must match training parameters
+SAMPLE_RATE = 22050
+DURATION = 3
+N_MELS = 128
+N_FFT = 2048
+HOP_LENGTH = 512
+N_MFCC = 40
+FMAX = 8000
 
-# Try to import sounddevice for microphone recording
-try:
-    import sounddevice as sd
-    MICROPHONE_AVAILABLE = True
-except ImportError:
-    sd = None
-    MICROPHONE_AVAILABLE = False
+# Adjusted threshold - start conservative
+DEFAULT_THRESHOLD = 0.60  # Higher = fewer false positives
 
 
-def convert_to_wav(input_file, output_file='temp_converted.wav'):
-    """Convert any audio format to WAV using pydub"""
-    try:
-        if not PYDUB_AVAILABLE or AudioSegment is None:
+class ImprovedScreamDetector:
+    """Improved scream detector with better feature extraction"""
+    
+    def __init__(self, model_path='best_scream_model.h5'):
+        print(f"\n🔧 Loading model: {model_path}")
+        
+        if not os.path.exists(model_path):
+            raise FileNotFoundError(f"Model not found: {model_path}")
+        
+        self.model = keras.models.load_model(model_path)
+        self.sr = SAMPLE_RATE
+        self.duration = DURATION
+        self.samples = self.sr * self.duration
+        
+        print(f"✓ Model loaded")
+        print(f"  Sample rate: {self.sr} Hz")
+        print(f"  Duration: {self.duration}s")
+        print(f"  Default threshold: {DEFAULT_THRESHOLD}")
+        
+    def extract_features(self, audio):
+        """Extract features exactly as in improved training"""
+        # Check energy
+        audio_energy = np.sum(audio ** 2) / len(audio)
+        if audio_energy < 1e-6:
+            print("⚠️  Very low energy (silence)")
             return None
         
-        print(f"Converting {Path(input_file).suffix} to WAV...")
-        audio = AudioSegment.from_file(input_file)
+        # Ensure fixed length
+        if len(audio) < self.samples:
+            audio = np.pad(audio, (0, self.samples - len(audio)), mode='constant')
+        else:
+            audio = audio[:self.samples]
         
-        if audio.channels > 1:
-            audio = audio.set_channels(1)
+        # CRITICAL: Normalize audio amplitude
+        audio = audio / (np.max(np.abs(audio)) + 1e-8)
         
-        audio.export(output_file, format='wav')
-        print("✓ Conversion successful")
-        return output_file
-    except Exception as e:
-        print(f"❌ Conversion failed: {e}")
-        return None
-
-
-def read_wav(filepath):
-    """Read WAV file"""
-    try:
-        with wave.open(str(filepath), 'rb') as w:
-            channels = w.getnchannels()
-            width = w.getsampwidth()
-            rate = w.getframerate()
-            frames = w.getnframes()
+        # Extract mel spectrogram
+        mel_spec = librosa.feature.melspectrogram(
+            y=audio,
+            sr=self.sr,
+            n_mels=N_MELS,
+            n_fft=N_FFT,
+            hop_length=HOP_LENGTH,
+            fmax=FMAX
+        )
+        mel_spec_db = librosa.power_to_db(mel_spec, ref=np.max)
+        
+        # Extract MFCC
+        mfcc = librosa.feature.mfcc(
+            y=audio,
+            sr=self.sr,
+            n_mfcc=N_MFCC,
+            n_fft=N_FFT,
+            hop_length=HOP_LENGTH
+        )
+        
+        # Extract delta MFCCs
+        mfcc_delta = librosa.feature.delta(mfcc)
+        
+        # Extract spectral contrast
+        spectral_contrast = librosa.feature.spectral_contrast(
+            y=audio,
+            sr=self.sr,
+            n_fft=N_FFT,
+            hop_length=HOP_LENGTH
+        )
+        
+        # Combine all features
+        combined = np.vstack([mel_spec_db, mfcc, mfcc_delta, spectral_contrast])
+        
+        # Standardize per channel
+        combined = (combined - np.mean(combined, axis=1, keepdims=True)) / (np.std(combined, axis=1, keepdims=True) + 1e-8)
+        
+        # Add batch and channel dimensions
+        combined = combined[np.newaxis, ..., np.newaxis]
+        
+        return combined
+    
+    def analyze_audio_characteristics(self, audio):
+        """Analyze audio to help debug false positives"""
+        # Energy
+        energy = np.sum(audio ** 2) / len(audio)
+        
+        # RMS (loudness)
+        rms = np.sqrt(np.mean(audio ** 2))
+        
+        # Zero crossing rate (roughness/noisiness)
+        zcr = np.mean(librosa.feature.zero_crossing_rate(audio))
+        
+        # Spectral centroid (brightness)
+        spectral_centroid = np.mean(librosa.feature.spectral_centroid(y=audio, sr=self.sr))
+        
+        # Spectral rolloff (frequency content)
+        spectral_rolloff = np.mean(librosa.feature.spectral_rolloff(y=audio, sr=self.sr))
+        
+        return {
+            'energy': energy,
+            'rms': rms,
+            'zcr': zcr,
+            'spectral_centroid': spectral_centroid,
+            'spectral_rolloff': spectral_rolloff
+        }
+    
+    def predict_from_audio(self, audio, return_analysis=False):
+        """Predict if audio contains a scream"""
+        features = self.extract_features(audio)
+        
+        if features is None:
+            return None if not return_analysis else (None, None)
+        
+        prediction = self.model.predict(features, verbose=0)[0][0]
+        
+        if return_analysis:
+            analysis = self.analyze_audio_characteristics(audio)
+            return prediction, analysis
+        
+        return prediction
+    
+    def predict_from_file(self, file_path):
+        """Predict from audio file"""
+        print(f"\n📂 Loading: {file_path}")
+        
+        try:
+            audio, _ = librosa.load(file_path, sr=self.sr, duration=self.duration)
             
-            if rate <= 0 or frames <= 0:
+            audio_energy = np.sum(audio ** 2) / len(audio)
+            print(f"   Energy: {audio_energy:.6f}")
+            
+            if audio_energy < 1e-6:
+                print("⚠️  Audio appears silent")
                 return None, None
             
-            raw = w.readframes(frames)
-            
-            if width == 1:
-                data = np.frombuffer(raw, dtype=np.uint8).astype(np.float64)
-                data = (data - 128.0) / 128.0
-            elif width == 2:
-                data = np.frombuffer(raw, dtype=np.int16).astype(np.float64) / 32768.0
-            else:
-                return None, None
-            
-            if channels == 2:
-                data = data.reshape(-1, 2).mean(axis=1)
-            
-            return data, int(rate)
-    except Exception as e:
-        return None, None
-
-
-def read_any_audio(filepath):
-    """Read any audio format"""
-    filepath = str(filepath).strip('"').strip("'")
+            prediction, analysis = self.predict_from_audio(audio, return_analysis=True)
+            return prediction, analysis
+        except Exception as e:
+            print(f"❌ Error: {e}")
+            return None, None
     
-    if not os.path.exists(filepath):
-        print(f"❌ File not found: {filepath}")
-        return None, None
-    
-    if filepath.lower().endswith('.wav'):
-        return read_wav(filepath)
-    
-    if PYDUB_AVAILABLE:
-        temp_wav = 'temp_converted.wav'
-        converted = convert_to_wav(filepath, temp_wav)
-        if converted:
-            audio, sr = read_wav(temp_wav)
+    def record_and_predict(self, duration=None, device=None):
+        """Record from microphone and predict"""
+        if duration is None:
+            duration = self.duration
+        
+        print(f"\n🎤 Recording for {duration}s...")
+        
+        if device is None:
             try:
-                os.remove(temp_wav)
+                default_device = sd.query_devices(kind='input')
+                print(f"   Device: {default_device['name']}")
             except:
                 pass
-            return audio, sr
-    
-    return None, None
+        
+        print("   🔴 RECORDING NOW!")
+        
+        try:
+            audio = sd.rec(
+                int(duration * self.sr),
+                samplerate=self.sr,
+                channels=1,
+                dtype='float32',
+                device=device,
+                blocking=True
+            )
+            
+            print("✓ Recording complete!")
+            audio = audio.flatten()
+            
+            if len(audio) == 0:
+                print("❌ No audio captured")
+                return None, None, None
+            
+            # Check audio
+            audio_energy = np.sum(audio ** 2) / len(audio)
+            max_amplitude = np.max(np.abs(audio))
+            
+            print(f"   Energy: {audio_energy:.6f}")
+            print(f"   Max amplitude: {max_amplitude:.6f}")
+            
+            if audio_energy < 1e-10:
+                print("\n⚠️  NO AUDIO DETECTED!")
+                print("\n📋 Troubleshooting:")
+                print("  1. Check microphone permissions")
+                print("  2. Increase microphone volume")
+                print("  3. Use option 2 (test with file) instead")
+                return None, None, None
+            
+            if max_amplitude < 0.001:
+                print("\n⚠️  Audio too quiet!")
+                print("  Increase mic volume or use test file")
+                return None, None, None
+            
+            # Predict
+            prediction, analysis = self.predict_from_audio(audio, return_analysis=True)
+            
+            return prediction, analysis, audio
+            
+        except Exception as e:
+            print(f"\n❌ Recording error: {e}")
+            return None, None, None
 
 
-def record_from_microphone(duration=3, sample_rate=22050):
-    """Record audio from microphone"""
-    if not MICROPHONE_AVAILABLE or sd is None:
-        print("❌ Microphone recording not available")
-        return None, None
+def print_detailed_prediction(prediction, analysis=None, threshold=DEFAULT_THRESHOLD):
+    """Print prediction with detailed analysis"""
+    if prediction is None:
+        print("\n⚠️  Cannot predict (no audio)")
+        return
     
-    try:
-        print(f"\n🎤 Recording for {duration} seconds...")
-        print("   SCREAM NOW!")
-        
-        audio = sd.rec(int(duration * sample_rate), 
-                      samplerate=sample_rate, 
-                      channels=1, 
-                      dtype='float64')
-        sd.wait()
-        
-        print("✓ Recording complete!")
-        audio = audio.flatten()
-        return audio, sample_rate
-    except Exception as e:
-        print(f"❌ Recording failed: {e}")
-        return None, None
-
-
-def extract_features(audio, sr):
-    """Extract features from audio"""
-    if audio is None or sr is None or len(audio) == 0:
-        return None
+    is_scream = prediction >= threshold
+    confidence = prediction * 100
     
-    try:
-        sr = int(sr)
-        audio = audio.astype(np.float64)
-        features = []
-        
-        # Time domain features
-        features.extend([
-            float(np.mean(audio)),
-            float(np.std(audio)),
-            float(np.max(np.abs(audio))),
-            float(np.min(audio)),
-            float(np.median(audio)),
-            float(np.sqrt(np.mean(audio**2)))
-        ])
-        
-        # Zero crossing rate
-        zcr = np.sum(np.abs(np.diff(np.sign(audio)))) / (2.0 * len(audio))
-        features.append(float(zcr))
-        
-        # Spectral features
-        fft = np.abs(np.fft.rfft(audio))
-        freqs = np.fft.rfftfreq(len(audio), 1.0/sr)
-        
-        if np.sum(fft) > 0:
-            centroid = np.sum(freqs * fft) / np.sum(fft)
-            spread = np.sqrt(np.sum(((freqs - centroid)**2) * fft) / np.sum(fft))
-        else:
-            centroid, spread = 0.0, 0.0
-        
-        features.extend([float(centroid), float(spread)])
-        
-        # Spectral rolloff
-        cumsum = np.cumsum(fft)
-        if cumsum[-1] > 0:
-            rolloff_idx = np.where(cumsum >= 0.85 * cumsum[-1])[0]
-            rolloff = float(freqs[rolloff_idx[0]]) if len(rolloff_idx) > 0 else 0.0
-        else:
-            rolloff = 0.0
-        features.append(rolloff)
-        
-        features.extend([
-            float(np.mean(fft)),
-            float(np.std(fft)),
-            float(np.max(fft))
-        ])
-        
-        # Frame-based features
-        frame_size = min(2048, len(audio)//4)
-        hop = max(1, frame_size//4)
-        
-        energies = []
-        for i in range(0, len(audio)-frame_size, hop):
-            frame = audio[i:i+frame_size]
-            energies.append(np.sum(frame**2))
-        
-        if energies:
-            features.extend([
-                float(np.mean(energies)),
-                float(np.std(energies)),
-                float(np.max(energies))
-            ])
-        else:
-            features.extend([0.0, 0.0, 0.0])
-        
-        result = np.array(features, dtype=np.float64)
-        
-        if np.any(np.isnan(result)) or np.any(np.isinf(result)):
-            return None
-        
-        return result
-    except Exception as e:
-        return None
-
-
-def predict_audio(model, audio, sr, filename="audio"):
-    """Predict if audio contains scream"""
-    if audio is None or sr is None:
-        print("\n❌ NO SCREAM DETECTED (Invalid audio)")
-        return None
-    
-    features = extract_features(audio, sr)
-    if features is None:
-        print("\n❌ NO SCREAM DETECTED (Feature extraction failed)")
-        return None
-    
-    # Normalize
-    features_norm = (features - model['mean']) / model['std']
-    
-    # KNN prediction
-    distances = np.sqrt(np.sum((model['X_train'] - features_norm)**2, axis=1))
-    k_nearest_idx = np.argsort(distances)[:model['k']]
-    k_labels = model['y_train'][k_nearest_idx]
-    
-    scream_votes = np.sum(k_labels)
-    prediction = 1 if scream_votes > model['k']/2 else 0
-    confidence = (scream_votes / model['k'] * 100) if prediction == 1 else ((model['k'] - scream_votes) / model['k'] * 100)
-    
-    # Simple result output
     print("\n" + "="*70)
-    if prediction == 1:
-        print(f"🟥SCREAM DETECTED! (Confidence: {confidence:.1f}%)")
-    else:
-        print(f"🟩NO SCREAM DETECTED (Confidence: {confidence:.1f}%)")
+    print("PREDICTION RESULTS")
     print("="*70)
     
-    return prediction
+    if is_scream:
+        print(f"🚨 SCREAM DETECTED!")
+        print(f"   Confidence: {confidence:.2f}%")
+    else:
+        print(f"✓ No scream detected")
+        print(f"   Non-scream confidence: {100-confidence:.2f}%")
+    
+    # Visual bar
+    bar_length = int(confidence / 2) if is_scream else int((100-confidence) / 2)
+    bar = "█" * bar_length + "░" * (50 - bar_length)
+    print(f"   [{bar}]")
+    
+    print(f"\n   Raw score: {prediction:.4f}")
+    print(f"   Threshold: {threshold:.2f}")
+    
+    # Interpretation
+    if prediction < 0.3:
+        print(f"   📊 Very unlikely to be a scream")
+    elif prediction < threshold:
+        print(f"   📊 Probably not a scream")
+    elif prediction < 0.8:
+        print(f"   📊 Possibly a scream")
+    else:
+        print(f"   📊 Very likely a scream")
+    
+    print("="*70 + "\n")
 
 
-def predict_from_file(model, filepath):
-    """Load audio file and predict"""
-    filepath = str(filepath).strip('"').strip("'")
+def test_from_microphone(detector, threshold=DEFAULT_THRESHOLD):
+    """Test with microphone"""
+    print("\n" + "="*70)
+    print(" "*20 + "MICROPHONE TEST")
+    print("="*70)
     
-    print(f"\nAnalyzing: {Path(filepath).name}")
-    result = read_any_audio(filepath)
+    prediction, analysis, audio = detector.record_and_predict()
     
-    if result is None or result[0] is None or result[1] is None:
-        print("\nNO SCREAM DETECTED (Failed to read audio)")
-        return None
+    if prediction is not None:
+        print_detailed_prediction(prediction, analysis, threshold)
+    else:
+        print("\n❌ Recording failed")
+
+
+def test_from_file(detector, file_path, threshold=DEFAULT_THRESHOLD):
+    """Test with audio file"""
+    print("\n" + "="*70)
+    print(" "*20 + "FILE TEST")
+    print("="*70)
     
-    audio, sr = result
-    return predict_audio(model, audio, sr, Path(filepath).name)
+    prediction, analysis = detector.predict_from_file(file_path)
+    
+    if prediction is not None:
+        print_detailed_prediction(prediction, analysis, threshold)
+    else:
+        print("\n❌ Failed to process file")
+
+
+def continuous_monitoring(detector, chunk_duration=3, threshold=DEFAULT_THRESHOLD):
+    """Continuous monitoring mode"""
+    print("\n" + "="*70)
+    print(" "*15 + "CONTINUOUS MONITORING")
+    print("="*70)
+    print(f"\nMonitoring microphone...")
+    print(f"Threshold: {threshold}")
+    print("\nPress Ctrl+C to stop\n")
+    
+    consecutive_silence = 0
+    
+    try:
+        while True:
+            audio = sd.rec(
+                int(chunk_duration * SAMPLE_RATE),
+                samplerate=SAMPLE_RATE,
+                channels=1,
+                dtype='float32'
+            )
+            sd.wait()
+            audio = audio.flatten()
+            
+            audio_energy = np.sum(audio ** 2) / len(audio)
+            timestamp = time.strftime("%H:%M:%S")
+            
+            if audio_energy < 1e-6:
+                consecutive_silence += 1
+                if consecutive_silence % 5 == 1:
+                    print(f"[{timestamp}] 🔇 Silence", end='\r')
+                continue
+            
+            consecutive_silence = 0
+            
+            prediction, analysis = detector.predict_from_audio(audio, return_analysis=True)
+            
+            if prediction is None:
+                continue
+            
+            if prediction >= threshold:
+                print(f"\n[{timestamp}] 🚨 SCREAM! Confidence: {prediction*100:.1f}% | Energy: {audio_energy:.6f}")
+                print(f"              Characteristics: Brightness={analysis['spectral_centroid']:.0f}Hz, Noisiness={analysis['zcr']:.3f}")
+                
+                save = input("Save? (y/n/c): ").strip().lower()
+                if save == 'y':
+                    filename = f"scream_{time.strftime('%Y%m%d_%H%M%S')}_{prediction:.2f}.wav"
+                    sf.write(filename, audio, SAMPLE_RATE)
+                    print(f"✓ Saved: {filename}\n")
+                elif save == 'c':
+                    continue
+            else:
+                print(f"[{timestamp}] ✓ Monitoring... Score: {prediction*100:.1f}% | Energy: {audio_energy:.6f}", end='\r')
+            
+    except KeyboardInterrupt:
+        print("\n\n✓ Stopped")
 
 
 def main():
-    """Main testing interface"""
+    """Main interface"""
     print("\n" + "="*70)
-    print("SCREAM DETECTOR - QUICK TEST")
+    print(" "*10 + "IMPROVED SCREAM DETECTION - TESTING")
     print("="*70)
     
-    # Load model
-    model_path = 'scream_model_knn.pkl'
-    if not os.path.exists(model_path):
-        print(f"\nModel not found: {model_path}")
-        sys.exit(1)
+    # Find model
+    model_files = ['best_scream_model.h5', 'scream_model_final.h5']
+    model_path = None
     
-    with open(model_path, 'rb') as f:
-        model = pickle.load(f)
+    for mf in model_files:
+        if os.path.exists(mf):
+            model_path = mf
+            break
     
-    print(f"✓ Model loaded (K={model['k']}, Samples={len(model['X_train'])})")
+    if not model_path:
+        print("\n❌ No model found!")
+        print("Train first: python train_scream_model_improved.py")
+        return
     
-    # Show options
+    # Load detector
+    try:
+        detector = ImprovedScreamDetector(model_path)
+    except Exception as e:
+        print(f"\n❌ Error loading model: {e}")
+        return
+    
+    # Fixed threshold
+    threshold = DEFAULT_THRESHOLD
+    print(f"\n✓ Using threshold: {threshold} (optimized for low false positives)")
+    
+    # Menu
     print("\n" + "="*70)
-    print("TESTING OPTIONS:")
+    print("SELECT MODE")
     print("="*70)
-    print("1. Record from microphone and test")
-    print("2. Test a single audio file")
-    print("3. Test all files in a folder")
-    print("="*70)
+    print("\n1. Test with microphone")
+    print("2. Test with audio file")
+    print("3. Continuous monitoring")
     
-    choice = input("\nEnter your choice (1-3): ").strip()
+    choice = input("\nChoice (1-3): ").strip()
     
     if choice == '1':
-        if not MICROPHONE_AVAILABLE:
-            print("\n❌ NO SCREAM DETECTED (Microphone not available)")
-            sys.exit(1)
+        test_from_microphone(detector, threshold)
         
-        duration_input = input("Recording duration in seconds (default 3): ").strip()
-        duration = int(duration_input) if duration_input.isdigit() else 3
-        
-        audio, sr = record_from_microphone(duration=duration)
-        predict_audio(model, audio, sr, "Live Recording")
-    
     elif choice == '2':
-        filepath = input("\nEnter audio file path: ").strip()
-        if filepath:
-            predict_from_file(model, filepath)
+        file_path = input("Audio file path: ").strip()
+        if os.path.exists(file_path):
+            test_from_file(detector, file_path, threshold)
         else:
-            print("\n❌ NO SCREAM DETECTED (No file provided)")
-    
+            print(f"❌ File not found: {file_path}")
+            
     elif choice == '3':
-        folder = input("\nEnter folder path: ").strip()
-        if folder:
-            folder = folder.strip('"').strip("'")
-            folder_path = Path(folder)
-            if not folder_path.exists():
-                print(f"\n❌ NO SCREAM DETECTED (Folder not found)")
-                sys.exit(1)
+        continuous_monitoring(detector, threshold=threshold)
             
-            audio_extensions = ['.wav', '.mp3', '.mp4', '.m4a', '.ogg', '.flac']
-            files = [f for f in folder_path.iterdir() if f.suffix.lower() in audio_extensions]
-            
-            if not files:
-                print("\n❌ NO SCREAM DETECTED (No audio files found)")
-                sys.exit(1)
-            
-            print(f"\nFound {len(files)} audio files\n")
-            scream_count = 0
-            
-            for i, filepath in enumerate(files, 1):
-                print(f"[{i}/{len(files)}] {filepath.name}...", end=" ")
-                result = predict_from_file(model, filepath)
-                if result == 1:
-                    scream_count += 1
-            
-            print("\n" + "="*70)
-            print(f"FINAL RESULT: {scream_count}/{len(files)} files contained screams")
-            print("="*70)
-        else:
-            print("\n❌ NO SCREAM DETECTED (No folder provided)")
-    
     else:
-        print("\n❌ Invalid choice")
-        sys.exit(1)
+        print("❌ Invalid choice")
     
-    print("\nTest complete. Exiting...")
-    sys.exit(0)
+    print("\n👋 Done!")
 
 
 if __name__ == "__main__":
