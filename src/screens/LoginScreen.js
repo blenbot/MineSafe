@@ -57,7 +57,7 @@ const LoginScreen = ({ navigation }) => {
         
         Alert.alert(
           '✅ Welcome!',
-          `Logged in as ${result.user.name}\nRole: ${result.user.role}\nMining Site: ${result.user.mining_site}`,
+          `Logged in as ${result.user.name}\nSupervisor: ${result.user.supervisor_name}`,
           [
             {
               text: 'OK',

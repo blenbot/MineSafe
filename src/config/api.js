@@ -1,12 +1,11 @@
 // API Configuration
 // ⚠️ CHANGE THIS TO YOUR ACTUAL BACKEND URL
 export const API_CONFIG = {
-  BASE_URL: 'http://192.168.1.100:8080/api', // Change to your server IP
+  BASE_URL: 'https://minesafego.onrender.com',
   ENDPOINTS: {
     AUTH: {
-      LOGIN: '/auth/login',
+      LOGIN: '/api/app/miner/login',
       LOGOUT: '/auth/logout',
-      VERIFY: '/auth/verify',
     },
     EMERGENCY: {
       CREATE: '/emergencies',

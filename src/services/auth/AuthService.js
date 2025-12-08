@@ -4,6 +4,8 @@ import API_CONFIG from '../../config/api';
 class AuthService {
   /**
    * Login user with email and password
+   * Backend expects: { email: string, password: string }
+   * Backend returns: { token: string, miner_id: string, miner_name: string, supervisor_name: string }
    */
   async login(email, password) {
     try {
@@ -16,21 +18,36 @@ class AuthService {
           email: email.trim().toLowerCase(),
           password: password,
         }),
-        timeout: API_CONFIG.TIMEOUT,
       });
+
+      // Handle non-JSON error responses
+      const contentType = response.headers.get('content-type');
+      if (!contentType || !contentType.includes('application/json')) {
+        const errorText = await response.text();
+        throw new Error(errorText || 'Login failed');
+      }
 
       const data = await response.json();
 
       if (!response.ok) {
-        throw new Error(data.message || 'Login failed');
+        throw new Error(data.message || data.error || 'Login failed');
       }
 
+      // Transform backend response to user object for storage
+      const user = {
+        user_id: data.miner_id,
+        name: data.miner_name,
+        supervisor_name: data.supervisor_name,
+        role: 'MINER',
+        email: email.trim().toLowerCase(),
+      };
+
       // Store authentication data
-      await this.storeAuthData(data);
+      await this.storeAuthData(data.token, user);
 
       return {
         success: true,
-        user: data.user,
+        user: user,
         token: data.token,
       };
     } catch (error) {
@@ -44,17 +61,19 @@ class AuthService {
 
   /**
    * Store authentication data securely
+   * @param {string} token - JWT token from backend
+   * @param {object} user - User object constructed from backend response
    */
-  async storeAuthData(data) {
+  async storeAuthData(token, user) {
     try {
       await AsyncStorage.multiSet([
-        ['authToken', data.token],
-        ['userData', JSON.stringify(data.user)],
-        ['userId', data.user.user_id],
-        ['userRole', data.user.role],
+        ['authToken', token],
+        ['userData', JSON.stringify(user)],
+        ['userId', user.user_id],
+        ['userRole', user.role],
         ['loginTime', new Date().toISOString()],
       ]);
-      console.log('✅ Auth data stored:', data.user.user_id);
+      console.log('✅ Auth data stored:', user.user_id);
     } catch (error) {
       console.error('❌ Failed to store auth data:', error);
       throw error;
