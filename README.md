@@ -1,4 +1,0 @@
-
-# 🚨 MineSafe
-![](minesafe.png)
-
