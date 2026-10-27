@@ -235,7 +235,7 @@ export default function App() {
           component={ReportHazardScreen}
         />
 
-        {/* Admin Screens */}
+        {/* Admin Screens 1 */}
         <Stack.Screen 
           name="AdminHome" 
           component={AdminHomeScreen}
